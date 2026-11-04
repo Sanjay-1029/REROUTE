@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+
+agent_backup.py
+decision_pipeline_backup.py
+*.zip
+
+.DS_Store
+Thumbs.db
+# Webots generated files
+webot/libraries/
+webot/plugins/
+webot/controllers/*/build/
+*.exe
+*.dll
+*.o
+*.d

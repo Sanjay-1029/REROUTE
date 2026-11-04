@@ -1,0 +1,153 @@
+﻿
+========== agent.py ==========
+from __future__ import annotations
+from dataclasses import dataclass, field
+import base64
+import os
+import time
+from typing import Any, Callable
+from environment import Environment, MoveResult, Position
+from diagnosis import FailureDiagnosis
+from failure_detector import FailureDetector, FailureRecord
+from pathfinder import SearchResult, astar_search, bfs_search
+from recovery import RecoveryAction, RecoveryEngine, RecoveryRecord
+from outcome_verifier import VerificationState
+from adaptive_learning import AdaptiveOutcomeMemory
+from recovery import RecoveryDecision, RecoveryAction
+class ActionRecord:
+class AgentEvent:
+class AgentExecutionCancelled(Exception):
+class AgentRunResult:
+    def successful_moves(self) -> int:
+    def failed_moves(self) -> int:
+class AutonomousAgent:
+    def __init__(
+    def plan_route(self) -> SearchResult:
+    def run(self, max_steps: int | None = None) -> AgentRunResult:
+    def execute_next(self, expected_position: Position | list[int]) -> ActionRecord:
+    def _result(self, reached_goal: bool, reason: str) -> AgentRunResult:
+    def _recover(self, failure: FailureRecord, expected: Position | None) -> bool:
+    def _recover_m9(self, failure: FailureRecord, expected: Position | None) -> bool:
+    def _collect_visual_context(
+    def _record_visual_observation(self, context: dict[str, Any], phase: str) -> dict[str, Any]:
+    def _recover_m11(self, failure: FailureRecord, expected: Position | None) -> bool:
+    def _verify_progress_restored(self, position: Position) -> None:
+    def _verify_task_completed(self) -> None:
+    def _safe_alternative_exists(self) -> bool:
+    def _blocked_route_positions(self, route: list[list[int]]) -> list[Position]:
+    def _log(self, message: str) -> None:
+    def _emit(self, activity: str, **payload: Any) -> None:
+
+========== simulation_controller.py ==========
+from __future__ import annotations
+from collections import deque
+from threading import Condition, Thread
+import time
+from typing import Callable
+from agent import AgentEvent, AgentExecutionCancelled, AutonomousAgent
+from environment import Environment
+from milestone11_scenarios import validation_factories
+from visual_models import ActivityItem, DashboardSnapshot
+from decision_pipeline import run_decision_pipeline
+from meta_reasoning_adapter import get_recovery_recommendation
+from adaptive_learning import AdaptiveOutcomeMemory
+def mock_recommendation(context):
+def reroute_decision_policy(context, live_reasoning: bool = False):
+def scenario_factories() -> dict[str, Callable[[], Environment]]:
+class SimulationController:
+    def __init__(
+    def scenario_names(self) -> list[str]:
+    def start(self, scenario: str | None = None, start_paused: bool = False) -> None:
+    def pause(self) -> None:
+    def resume(self) -> None:
+    def step(self) -> None:
+    def reset(self, scenario: str | None = None) -> None:
+    def set_speed(self, speed: float) -> None:
+    def _run_agent(self) -> None:
+    def _on_agent_event(self, event: AgentEvent) -> bool | None:
+    def _apply_event(self, event: AgentEvent) -> None:
+def _event_message(event: AgentEvent) -> str:
+def _appearing_obstacle() -> Environment:
+def _temporary_obstacle() -> Environment:
+def _moving_obstacle() -> Environment:
+
+========== decision_pipeline.py ==========
+from __future__ import annotations
+from functools import lru_cache
+from typing import Any, Callable
+from meta_reasoning_adapter import get_recovery_recommendation
+from recommendation_validator import validate_recommendation
+from outcome_predictor import predict_outcome, build_action_statistics
+from decision_selector import select_best_action
+from evaluation import EvaluationRunner
+from visual_evidence import assess_visual_evidence
+from predictive_reasoner import rank_candidate_actions
+def _historical_action_statistics():
+def _build_evidence_context(context: dict[str, Any], recommendation: dict[str, Any]) -> dict[str, Any]:
+def run_decision_pipeline(
+
+========== environment.py ==========
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Iterable
+class MoveResult:
+class ScheduledObstacleEvent:
+class Environment:
+    def __init__(
+    def obstacles(self) -> list[list[int]]:
+    def move(self, direction: str) -> MoveResult:
+    def set_transient_move_failures(self, count: int) -> None:
+    def add_dynamic_obstacle(self, position: Iterable[int], duration: int | None = None) -> None:
+    def remove_dynamic_obstacle(self, position: Iterable[int]) -> bool:
+    def move_dynamic_obstacle(self, position: Iterable[int], destination: Iterable[int]) -> bool:
+    def schedule_obstacle_event(
+    def advance(self) -> None:
+    def get_state(self) -> dict[str, object]:
+    def obstacle_info(self, position: Iterable[int]) -> dict[str, object]:
+    def display(self, path: Iterable[Iterable[int]] | None = None) -> None:
+    def in_bounds(self, position: Iterable[int]) -> bool:
+    def _all_obstacles(self) -> set[Position]:
+    def _record_move(self, moved: bool, reason: str, previous_position: Position) -> MoveResult:
+    def _validate_position(self, position: Position) -> None:
+    def _as_position(position: Iterable[int]) -> Position:
+
+========== vision_engine.py ==========
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from datetime import datetime
+class VisionEngine:
+    def __init__(self, model_path="yolo11n.pt", confidence_threshold=0.25):
+    def load_image(self, image_path):
+    def process_image(self, image):
+    def detect_obstacles(self, image):
+    def detect_obstacle_regions(self, image):
+    def detect_objects(self, image):
+    def classify_position(self, x1, x2, image_width):
+    def assess_obstacle_risk(self, detection):
+    def build_environment_state(self, image):
+    def prepare_reasoning_context(self, navigation_context, image):
+    def display_results(self, edges):
+    def analyze_image(self, image_path):
+
+========== pathfinder.py ==========
+from __future__ import annotations
+from collections import deque
+from dataclasses import dataclass
+from heapq import heappop, heappush
+from itertools import count
+from typing import Iterable
+class SearchResult:
+    def steps(self) -> int | None:
+def bfs_search(start: Iterable[int], goal: Iterable[int], obstacles: Iterable[Iterable[int]], width: int, height: int) -> SearchResult:
+def astar_search(start: Iterable[int], goal: Iterable[int], obstacles: Iterable[Iterable[int]], width: int, height: int) -> SearchResult:
+def find_path(start, goal, obstacles, width, height):
+def _prepare(start: Iterable[int], goal: Iterable[int], obstacles: Iterable[Iterable[int]], width: int, height: int) -> tuple[Position, Position, set[Position]]:
+def _neighbors(position: Position, blocked: set[Position], width: int, height: int):
+def _reconstruct(came_from: dict[Position, Position | None], goal: Position) -> list[Position]:
+def _position(value: Iterable[int]) -> Position:
+def _in_bounds(position: Position, width: int, height: int) -> bool:
+def _to_lists(path: list[Position]) -> list[list[int]]:
+def _manhattan(first: Position, second: Position) -> int:
+
+========== README.md ==========

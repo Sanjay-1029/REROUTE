@@ -1,0 +1,637 @@
+﻿
+========== environment.py ==========
+"""Grid-world simulation used by the REROUTE agent."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+Position = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class MoveResult:
+    """The verified outcome of a requested movement."""
+
+    moved: bool
+    reason: str
+    previous_position: Position
+    current_position: Position
+
+
+@dataclass(frozen=True)
+class ScheduledObstacleEvent:
+    """A deterministic obstacle change applied when the environment reaches a tick."""
+
+    tick: int
+    action: str
+    position: Position
+    destination: Position | None = None
+    duration: int | None = None
+
+
+class Environment:
+    """A rectangular grid with static and runtime-added obstacles."""
+
+    DIRECTIONS: dict[str, Position] = {
+        "up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0),
+    }
+    DEFAULT_OBSTACLES: tuple[Position, ...] = (
+        (2, 0), (2, 1), (2, 2), (4, 4), (4, 5), (4, 6),
+        (6, 7), (7, 7), (8, 7),
+    )
+
+    def __init__(
+        self,
+        width: int = 10,
+        height: int = 10,
+        agent_position: Iterable[int] = (0, 0),
+        goal_position: Iterable[int] = (9, 9),
+        obstacles: Iterable[Iterable[int]] | None = None,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("Grid width and height must be positive.")
+        self.width = width
+        self.height = height
+        self.agent_position = self._as_position(agent_position)
+        self.goal_position = self._as_position(goal_position)
+        self._validate_position(self.agent_position)
+        self._validate_position(self.goal_position)
+
+        initial_obstacles = self.DEFAULT_OBSTACLES if obstacles is None else obstacles
+        self._static_obstacles = {self._as_position(position) for position in initial_obstacles}
+        for obstacle in self._static_obstacles:
+            self._validate_position(obstacle)
+        if self.agent_position in self._static_obstacles or self.goal_position in self._static_obstacles:
+            raise ValueError("The agent and goal cannot occupy an obstacle.")
+
+        self._dynamic_obstacles: dict[Position, int | None] = {}
+        self._scheduled_events: list[ScheduledObstacleEvent] = []
+        self._transient_move_failures = 0
+        self.tick = 0
+        self.state_version = 0
+        self.events: list[str] = []
+
+    @property
+    def obstacles(self) -> list[list[int]]:
+        """Current obstacles in the list format expected by the existing BFS code."""
+        return [list(position) for position in sorted(self._all_obstacles())]
+
+    def move(self, direction: str) -> MoveResult:
+        """Attempt one movement and return a verified outcome without printing."""
+        previous_position = self.agent_position
+        if self._transient_move_failures:
+            self._transient_move_failures -= 1
+            self.events.append(f"move_failed:transient_failure:{previous_position}")
+            return MoveResult(False, "transient_failure", previous_position, previous_position)
+        if direction not in self.DIRECTIONS:
+            return self._record_move(False, "invalid_direction", previous_position)
+        dx, dy = self.DIRECTIONS[direction]
+        target = (previous_position[0] + dx, previous_position[1] + dy)
+        if not self.in_bounds(target):
+            return self._record_move(False, "outside_grid", previous_position)
+        if target in self._all_obstacles():
+            return self._record_move(False, "obstacle", previous_position)
+
+        self.agent_position = target
+        self.state_version += 1
+        self.events.append(f"move:{direction}:{previous_position}->{target}")
+        return MoveResult(True, "moved", previous_position, target)
+
+    def set_transient_move_failures(self, count: int) -> None:
+        """Configure a deterministic number of injected move failures for experiments."""
+        if count < 0:
+            raise ValueError("Failure count cannot be negative.")
+        self._transient_move_failures = count
+        self.events.append(f"transient_move_failures_configured:{count}")
+
+    def add_dynamic_obstacle(self, position: Iterable[int], duration: int | None = None) -> None:
+        """Add a runtime obstacle, optionally expiring after ``duration`` updates."""
+        obstacle = self._as_position(position)
+        self._validate_position(obstacle)
+        if obstacle == self.agent_position or obstacle == self.goal_position:
+            raise ValueError("Cannot place a dynamic obstacle on the agent or goal.")
+        if duration is not None and duration <= 0:
+            raise ValueError("Obstacle duration must be positive or None.")
+        self._dynamic_obstacles[obstacle] = duration
+        self.state_version += 1
+        self.events.append(f"dynamic_obstacle_added:{obstacle}:duration={duration}")
+
+    def remove_dynamic_obstacle(self, position: Iterable[int]) -> bool:
+        """Remove a runtime obstacle and report whether one was present."""
+        obstacle = self._as_position(position)
+        if obstacle not in self._dynamic_obstacles:
+            return False
+        del self._dynamic_obstacles[obstacle]
+        self.state_version += 1
+        self.events.append(f"dynamic_obstacle_removed:{obstacle}")
+        return True
+
+    def move_dynamic_obstacle(self, position: Iterable[int], destination: Iterable[int]) -> bool:
+        """Move one existing dynamic obstacle to an unoccupied valid position."""
+        source, target = self._as_position(position), self._as_position(destination)
+        if source not in self._dynamic_obstacles:
+            return False
+        self._validate_position(target)
+        if target in self._all_obstacles() or target in {self.agent_position, self.goal_position}:
+            raise ValueError("Dynamic obstacle destination is occupied or reserved.")
+        duration = self._dynamic_obstacles.pop(source)
+        self._dynamic_obstacles[target] = duration
+        self.state_version += 1
+        self.events.append(f"dynamic_obstacle_moved:{source}->{target}")
+        return True
+
+    def schedule_obstacle_event(
+        self, tick: int, action: str, position: Iterable[int],
+        destination: Iterable[int] | None = None, duration: int | None = None,
+    ) -> None:
+        """Schedule an add, remove, or move event for reproducible simulations."""
+        if tick <= self.tick:
+            raise ValueError("Scheduled tick must be in the future.")
+        if action not in {"add", "remove", "move"}:
+            raise ValueError("Scheduled action must be 'add', 'remove', or 'move'.")
+        source = self._as_position(position)
+        target = self._as_position(destination) if destination is not None else None
+        if action == "move" and target is None:
+            raise ValueError("A move event requires a destination.")
+        event = ScheduledObstacleEvent(tick, action, source, target, duration)
+        self._scheduled_events.append(event)
+        self._scheduled_events.sort(key=lambda item: item.tick)
+        self.events.append(f"obstacle_event_scheduled:{event}")
+
+    def advance(self) -> None:
+        """Advance one environment update and expire temporary obstacles."""
+        self.tick += 1
+        expired: list[Position] = []
+        for position, remaining in self._dynamic_obstacles.items():
+            if remaining is not None:
+                self._dynamic_obstacles[position] = remaining - 1
+                if remaining == 1:
+                    expired.append(position)
+        for position in expired:
+            del self._dynamic_obstacles[position]
+            self.events.append(f"dynamic_obstacle_expired:{position}")
+        due_events = [event for event in self._scheduled_events if event.tick == self.tick]
+        self._scheduled_events = [event for event in self._scheduled_events if event.tick != self.tick]
+        for event in due_events:
+            if event.action == "add":
+                self.add_dynamic_obstacle(event.position, event.duration)
+            elif event.action == "remove":
+                self.remove_dynamic_obstacle(event.position)
+            else:
+                self.move_dynamic_obstacle(event.position, event.destination)
+            self.events.append(f"obstacle_event_applied:{event}")
+        self.state_version += 1
+
+    def get_state(self) -> dict[str, object]:
+        """Return a copy-safe state snapshot for controllers and diagnostics."""
+        return {
+            "width": self.width, "height": self.height,
+            "agent_position": self.agent_position, "goal_position": self.goal_position,
+            "obstacles": tuple(sorted(self._all_obstacles())), "tick": self.tick,
+            "state_version": self.state_version,
+        }
+
+    def obstacle_info(self, position: Iterable[int]) -> dict[str, object]:
+        """Return non-secret obstacle metadata used for failure classification."""
+        obstacle = self._as_position(position)
+        if obstacle in self._dynamic_obstacles:
+            remaining = self._dynamic_obstacles[obstacle]
+            return {"present": True, "kind": "dynamic", "temporary": remaining is not None, "remaining_duration": remaining}
+        return {"present": obstacle in self._static_obstacles, "kind": "static" if obstacle in self._static_obstacles else None, "temporary": False, "remaining_duration": None}
+
+    def display(self, path: Iterable[Iterable[int]] | None = None) -> None:
+        """Print the current grid, optionally overlaying a proposed route."""
+        path_positions = {self._as_position(position) for position in path or ()}
+        print("\nEnvironment Map:")
+        print("A = Agent | G = Goal | # = Obstacle | * = Path | . = Empty")
+        obstacles = self._all_obstacles()
+        for y in range(self.height):
+            row: list[str] = []
+            for x in range(self.width):
+                position = (x, y)
+                if position == self.agent_position:
+                    row.append(" A ")
+                elif position == self.goal_position:
+                    row.append(" G ")
+                elif position in obstacles:
+                    row.append(" # ")
+                elif position in path_positions:
+                    row.append(" * ")
+                else:
+                    row.append(" . ")
+            print("".join(row))
+
+    def in_bounds(self, position: Iterable[int]) -> bool:
+        x, y = self._as_position(position)
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def _all_obstacles(self) -> set[Position]:
+        return self._static_obstacles | set(self._dynamic_obstacles)
+
+    def _record_move(self, moved: bool, reason: str, previous_position: Position) -> MoveResult:
+        self.events.append(f"move_failed:{reason}:{previous_position}")
+        return MoveResult(moved, reason, previous_position, previous_position)
+
+    def _validate_position(self, position: Position) -> None:
+        if not self.in_bounds(position):
+            raise ValueError(f"Position {position} is outside the grid.")
+
+    @staticmethod
+    def _as_position(position: Iterable[int]) -> Position:
+        values = tuple(position)
+        if len(values) != 2 or not all(isinstance(value, int) for value in values):
+            raise ValueError("Positions must contain exactly two integers.")
+        return values[0], values[1]
+
+========== simulation_controller.py ==========
+"""Thread-gated bridge between existing REROUTE logic and a live UI."""
+from __future__ import annotations
+from collections import deque
+from threading import Condition, Thread
+import time
+from typing import Callable
+from agent import AgentEvent, AgentExecutionCancelled, AutonomousAgent
+from environment import Environment
+from milestone11_scenarios import validation_factories
+from visual_models import ActivityItem, DashboardSnapshot
+from decision_pipeline import run_decision_pipeline
+from meta_reasoning_adapter import get_recovery_recommendation
+from adaptive_learning import AdaptiveOutcomeMemory
+
+
+def mock_recommendation(context):
+    """Offline provider for integration tests; never calls Meta."""
+    if context.get("path_blocked") and context.get("safe_alternative_route"):
+        action = "REPLAN"
+    elif context.get("path_blocked"):
+        action = "GATHER_INFORMATION"
+    else:
+        action = "WAIT"
+    return {
+        "recommended_action": action,
+        "reason": "Offline test recommendation based on supplied environment state.",
+        "confidence": 0.80,
+        "required_checks": ["Verify the selected action against the current environment."],
+        "alternative_action": "GATHER_INFORMATION" if action != "GATHER_INFORMATION" else "REQUEST_HUMAN_HELP",
+        "visual_summary": "Offline provider; no image was sent to Muse Spark.",
+        "uncertainties": ["This is a mock recommendation, not a model response."],
+    }
+
+
+def reroute_decision_policy(context, live_reasoning: bool = False):
+    provider = get_recovery_recommendation if live_reasoning else mock_recommendation
+    mode = "LIVE MUSE SPARK" if live_reasoning else "OFFLINE MOCK"
+    print(f"REROUTE: decision pipeline triggered ({mode}).")
+    result = run_decision_pipeline(context, recommendation_provider=provider)
+    if result.get("status") != "EVALUATED":
+        raise RuntimeError(f"Decision pipeline did not produce an executable decision: {result}")
+    return result
+
+
+def scenario_factories() -> dict[str, Callable[[], Environment]]:
+    factories = {
+        "Default navigation": Environment,
+        "M4 obstacle appears": _appearing_obstacle,
+        "M4 temporary obstacle": _temporary_obstacle,
+        "M4 moving obstacle": _moving_obstacle,
+    }
+    factories.update({f"M11 {name}": factory for name, factory in validation_factories().items()})
+    return factories
+
+
+class SimulationController:
+    """Controls playback by pausing agent callbacks, never its decisions."""
+    def __init__(
+        self,
+        live_reasoning: bool = False,
+        vision_engine=None,
+        image_provider=None,
+    ) -> None:
+        self.live_reasoning = live_reasoning
+        self.vision_engine = vision_engine
+        self.image_provider = image_provider
+        # Shared across simulation runs for this controller instance.
+        self.adaptive_memory = AdaptiveOutcomeMemory(persistent=True)
+        self._live_request_used = False
+        self.factories = scenario_factories()
+        self.snapshot = DashboardSnapshot()
+        self.speed = 3.0
+        self.paused = True
+        self._step_budget = 0
+        self._cancelled = False
+        self._condition = Condition()
+        self._thread: Thread | None = None
+        self._environment: Environment | None = None
+        self._agent: AutonomousAgent | None = None
+        self.events: deque[AgentEvent] = deque(maxlen=200)
+
+    @property
+    def scenario_names(self) -> list[str]:
+        return list(self.factories)
+
+    def start(self, scenario: str | None = None, start_paused: bool = False) -> None:
+        if self._thread and self._thread.is_alive():
+            self.resume()
+            return
+
+        selected = scenario or self.snapshot.scenario
+        if selected not in self.factories:
+            raise ValueError(f"Unknown scenario: {selected}")
+
+        self._cancelled = False
+        # Allow one live model request per run; a new run gets a fresh allowance.
+        self._live_request_used = False
+        self.paused = start_paused
+        self._step_budget = 0
+        self.events.clear()
+        self._environment = self.factories[selected]()
+
+        def decision_policy(context):
+            # Consume the single live-call allowance before making the request.
+            # A failed/timeout request still counts as an attempt, preventing retries.
+            use_live = self.live_reasoning and not self._live_request_used
+            if use_live:
+                self._live_request_used = True
+            return reroute_decision_policy(context, live_reasoning=use_live)
+
+        self._agent = AutonomousAgent(
+            self._environment,
+            recovery_mode="m11",
+            logger=lambda _: None,
+            event_callback=self._on_agent_event,
+            decision_policy=decision_policy,
+            vision_engine=self.vision_engine,
+            image_provider=self.image_provider,
+            adaptive_memory=self.adaptive_memory,
+        )
+
+        self.snapshot = DashboardSnapshot(
+            scenario=selected,
+            status="PAUSED" if start_paused else "RUNNING",
+            state=self._environment.get_state(),
+            start_position=self._environment.agent_position,
+        )
+        self._thread = Thread(target=self._run_agent, daemon=True)
+        self._thread.start()
+
+    def pause(self) -> None:
+        with self._condition:
+            self.paused = True
+            self.snapshot.status = "PAUSED"
+
+    def resume(self) -> None:
+        with self._condition:
+            self.paused = False
+            self.snapshot.status = "RUNNING"
+            self._condition.notify_all()
+
+    def step(self) -> None:
+        with self._condition:
+            if self._thread is None or not self._thread.is_alive():
+                self.start(self.snapshot.scenario, start_paused=True)
+            self.paused = True
+            self._step_budget += 1
+            self.snapshot.status = "PAUSED"
+            self._condition.notify_all()
+
+    def reset(self, scenario: str | None = None) -> None:
+        with self._condition:
+            self._cancelled = True
+            self.paused = False
+            self._condition.notify_all()
+        if self._thread:
+            self._thread.join(timeout=1)
+        selected = scenario or self.snapshot.scenario
+        if selected not in self.factories:
+            raise ValueError(f"Unknown scenario: {selected}")
+        environment = self.factories[selected]()
+        self._environment = environment
+        self._thread = None
+        self.snapshot = DashboardSnapshot(scenario=selected, status="READY", state=environment.get_state(), start_position=environment.agent_position)
+        self.events.clear()
+
+    def set_speed(self, speed: float) -> None:
+        self.speed = max(0.25, min(20.0, speed))
+
+    def _run_agent(self) -> None:
+        try:
+            assert self._agent is not None
+            outcome = self._agent.run()
+            with self._condition:
+                self.snapshot.reached_goal = outcome.reached_goal
+                if not outcome.reached_goal:
+                    self.snapshot.safe_stop_reason = outcome.reason
+                self.snapshot.status = "GOAL REACHED" if outcome.reached_goal else "SAFE STOP"
+        except AgentExecutionCancelled:
+            pass
+        except Exception as error:
+            with self._condition:
+                self.snapshot.status = "ERROR"
+                self.snapshot.safe_stop_reason = str(error)
+
+    def _on_agent_event(self, event: AgentEvent) -> bool | None:
+        with self._condition:
+            if self._cancelled:
+                return False
+            while self.paused and self._step_budget == 0 and not self._cancelled:
+                self._condition.wait()
+            if self._cancelled:
+                return False
+            if self._step_budget:
+                self._step_budget -= 1
+            self.events.append(event)
+            self._apply_event(event)
+        if not self.paused:
+            time.sleep(1 / self.speed)
+        return True
+
+    def _apply_event(self, event: AgentEvent) -> None:
+        payload = event.payload
+
+                # Preserve complete recovery decision and prediction history.
+        if event.activity == "RECOVERING":
+            decision_details = payload.get("decision_details")
+
+            self.snapshot.decision_history.append({
+                "tick": event.tick,
+                "state_version": event.state_version,
+                "decision_source": payload.get(
+                    "decision_source", "UNKNOWN"
+                ),
+                "recovery_action": payload.get("recovery_action"),
+                "decision_reason": payload.get("decision_reason", ""),
+                "decision_error": payload.get("decision_error"),
+                "decision_details": (
+                    dict(decision_details)
+                    if isinstance(decision_details, dict)
+                    else None
+                ),
+            })
+        self.snapshot.state = dict(payload["state"])
+        if self._environment is not None:
+            self.snapshot.state["obstacle_info"] = {
+                tuple(position): self._environment.obstacle_info(position)
+                for position in self.snapshot.state["obstacles"]
+            }
+        self.snapshot.route = tuple(payload.get("route", ()))
+        self.snapshot.alternative_route = tuple(payload.get("alternative_route", ()))
+        self.snapshot.status = event.activity
+        self.snapshot.nodes_explored = int(payload.get("nodes_explored", self.snapshot.nodes_explored))
+        self.snapshot.recovery_attempts = int(payload.get("recoveries", self.snapshot.recovery_attempts))
+        self.snapshot.failed_movements = int(payload.get("failures", self.snapshot.failed_movements))
+        message = _event_message(event)
+        self.snapshot.activity.append(ActivityItem(event.activity, event.tick, message))
+        self.snapshot.activity = self.snapshot.activity[-8:]
+        if event.activity == "MOVING" and payload.get("expected_position"):
+            self.snapshot.visited.add(tuple(payload["state"]["agent_position"]))
+        failure = payload.get("failure")
+        diagnosis = payload.get("diagnosis")
+        if failure:
+            self.snapshot.reasoning["failure"] = failure.failure_type.value
+            self.snapshot.reasoning["evidence"] = failure.evidence
+        if diagnosis:
+            self.snapshot.reasoning["cause"] = diagnosis.cause.value
+            self.snapshot.reasoning["confidence"] = f"{diagnosis.confidence:.2f}"
+            self.snapshot.reasoning["support"] = diagnosis.supporting_evidence[0] if diagnosis.supporting_evidence else ""
+        if payload.get("recovery_action"):
+            self.snapshot.reasoning["action"] = payload["recovery_action"]
+            self.snapshot.reasoning["decision"] = payload.get("decision_reason", "")
+            self.snapshot.reasoning["decision_error"] = payload.get("decision_error")
+            if payload["recovery_action"] == "RETRY": self.snapshot.retries += 1
+            if payload["recovery_action"] == "REPLAN": self.snapshot.replans += 1
+        if payload.get("verification_state"):
+            self.snapshot.reasoning["verification"] = payload["verification_state"]
+        if event.activity == "GOAL_REACHED": self.snapshot.reached_goal = True
+        if event.activity == "SAFE_STOP": self.snapshot.safe_stop_reason = str(payload.get("reason", "safe stop"))
+
+
+def _event_message(event: AgentEvent) -> str:
+    payload = event.payload
+    if event.activity == "MOVING": return f"{payload.get('direction', '?')} -> {payload.get('expected_position', '')}"
+    if event.activity == "PLANNING": return f"{payload.get('algorithm', '')}: {payload.get('path_length', '?')} steps"
+    if event.activity == "SAFE_STOP": return str(payload.get("reason", "safe stop"))
+    if event.activity == "RECOVERING" and payload.get("decision_error"):
+        return f"LOCAL FALLBACK: {payload['decision_error']}"
+    return event.activity.replace("_", " ")
+
+
+def _appearing_obstacle() -> Environment:
+    environment = Environment(); environment.schedule_obstacle_event(1, "add", (0, 1)); return environment
+
+def _temporary_obstacle() -> Environment:
+    environment = Environment(); environment.schedule_obstacle_event(1, "add", (0, 1), duration=1); return environment
+
+def _moving_obstacle() -> Environment:
+    environment = Environment(); environment.add_dynamic_obstacle((1, 1)); environment.schedule_obstacle_event(1, "move", (1, 1), destination=(0, 1)); return environment
+
+========== main.py ==========
+"""Run REROUTE scenarios. Offline by default; --live makes at most ONE Meta call."""
+from __future__ import annotations
+import argparse
+import os
+from pathlib import Path
+from scenarios import run_dynamic_scenarios
+from simulation_controller import reroute_decision_policy
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run REROUTE autonomous scenarios.")
+    parser.add_argument("--live", action="store_true", help="Use Muse Spark for at most one recovery decision (one API request).")
+    parser.add_argument("--image", type=Path, help="Optional local image attached to that one live request.")
+    args = parser.parse_args()
+
+    print("=" * 48)
+    print("          REROUTE AUTONOMOUS AGENT")
+    print("=" * 48)
+    if args.image:
+        image_path = args.image.expanduser().resolve()
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        os.environ["REROUTE_IMAGE_PATH"] = str(image_path)
+        print(f"Image configured for Muse Spark: {image_path.name}")
+
+    if args.live:
+        print("REASONING MODE: LIVE MUSE SPARK, hard limit = ONE API request for this run.")
+    else:
+        print("REASONING MODE: OFFLINE MOCK. No Meta API requests will be made.")
+
+    live_call_used = False
+    def policy(context):
+        nonlocal live_call_used
+        use_live = args.live and not live_call_used
+        if use_live:
+            live_call_used = True
+        return reroute_decision_policy(context, live_reasoning=use_live)
+
+    results = run_dynamic_scenarios(logger=print, decision_policy=policy)
+    print("\n========== FINAL RESULTS ==========")
+    for result in results:
+        print(f"\nScenario: {result.name}")
+        print(f"Initial route: {result.initial_route}")
+        print(f"Result: {result.outcome.reason}")
+        print(f"Goal reached: {result.outcome.reached_goal}")
+        print(f"Invalidated positions: {result.outcome.invalidated_positions}")
+        if "Temporary" in result.name:
+            print(f"Temporary obstacle cleared: {result.temporary_obstacle_cleared}")
+
+
+if __name__ == "__main__":
+    main()
+
+========== README.md ==========
+# REROUTE
+
+REROUTE is an uncertainty-aware autonomous navigation and recovery agent. It combines environment state, optional visual input, Muse Spark reasoning, action validation, historical outcome prediction, bounded execution, and outcome verification.
+
+## Setup (Windows PowerShell)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Create a `.env` file only if you intend to use Muse Spark:
+
+```text
+MODEL_API_KEY=your_key_here
+```
+
+Do not share or commit `.env`.
+
+## Run offline
+
+```powershell
+python -m unittest discover -v
+python main.py
+python milestone11_evaluation.py
+```
+
+Offline mode uses a mock reasoning provider and makes no Meta API calls.
+
+## One-request live smoke test
+
+```powershell
+python live_muse_test.py --image test_image.jpg
+```
+
+This sends exactly one image + context request and does not execute the recommended action.
+
+The full scenario runner can also use Muse Spark with a hard limit of one live API request per run:
+
+```powershell
+python main.py --live --image test_image.jpg
+```
+
+Remaining decisions in that run use the offline provider. Live API usage may incur charges.
+
+## Validation and scope
+
+See `FINAL_VALIDATION.md` and `DEVELOPMENT_STATUS.md`. The validated autonomous execution target is the grid-world simulation. This is not yet a physical robot deployment: real camera calibration, localization/depth sensing, and motor-control integration are separate hardware milestones.
+
+========== requirements.txt ==========
+requests>=2.31.0
+python-dotenv>=1.0.0
+flask>=3.0.0

@@ -1,0 +1,742 @@
+﻿
+========== decision_pipeline.py ==========
+"""Evidence -> recommendation -> validation -> prediction -> safe selection."""
+from __future__ import annotations
+from functools import lru_cache
+from typing import Any, Callable
+
+from meta_reasoning_adapter import get_recovery_recommendation
+from recommendation_validator import validate_recommendation
+from outcome_predictor import predict_outcome, build_action_statistics
+from decision_selector import select_best_action
+from evaluation import EvaluationRunner
+from visual_evidence import assess_visual_evidence
+from predictive_reasoner import rank_candidate_actions
+
+
+@lru_cache(maxsize=1)
+def _historical_action_statistics():
+    """Run deterministic offline evaluation once per process."""
+    return build_action_statistics(EvaluationRunner().run())
+
+
+def _build_evidence_context(context: dict[str, Any], recommendation: dict[str, Any]) -> dict[str, Any]:
+    """Merge adapter-verified visual provenance without inventing map facts."""
+    evidence_context = dict(context)
+    attached = recommendation.get("_reroute_visual_input_attached") is True
+    analyzed = recommendation.get("_reroute_visual_analysis_completed") is True and attached
+    summary = recommendation.get("visual_summary")
+
+    if analyzed:
+        observations = evidence_context.get("visual_observations", [])
+        if not isinstance(observations, list):
+            observations = []
+        observations = list(observations)
+        if isinstance(summary, str) and summary.strip() and summary not in observations:
+            observations.append(summary)
+        evidence_context["visual_observations"] = observations
+        evidence_context["perception_status"] = "IMAGE_ANALYZED"
+
+    return evidence_context
+
+
+def run_decision_pipeline(
+    context: dict[str, Any],
+    recommendation_provider: Callable | None = None,
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise TypeError("context must be a dictionary.")
+
+    statistics = {
+        action: dict(counts)
+        for action, counts in _historical_action_statistics().items()
+    }
+    # Verified runtime outcomes supplement the deterministic baseline. They
+    # never bypass feasibility checks or the selector's risk gates.
+    adaptive = context.get("adaptive_learning", {})
+    adaptive_stats = adaptive.get("action_statistics", {}) if isinstance(adaptive, dict) else {}
+    if isinstance(adaptive_stats, dict):
+        for action, counts in adaptive_stats.items():
+            if not isinstance(counts, dict):
+                continue
+            current = statistics.setdefault(action, {"success": 0, "failure": 0})
+            for outcome in ("success", "failure"):
+                value = counts.get(outcome, 0)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    current[outcome] = current.get(outcome, 0) + value
+
+    provider = recommendation_provider or get_recovery_recommendation
+    recommendation = provider(context)
+    valid, message = validate_recommendation(recommendation, context)
+
+    if not valid:
+        return {"status": "REJECTED", "reason": message, "original_recommendation": recommendation}
+
+    evidence_context = _build_evidence_context(context, recommendation)
+    visual_evidence = assess_visual_evidence(evidence_context, recommendation)
+    environment_state = {
+        **context,
+        **context.get("environment_state", {}),
+        "visual_evidence": visual_evidence,
+        "adaptive_learning": {
+            "source": adaptive.get("source", "NO_RUNTIME_HISTORY") if isinstance(adaptive, dict) else "NO_RUNTIME_HISTORY",
+            "diagnosis": adaptive.get("diagnosis", "ALL") if isinstance(adaptive, dict) else "ALL",
+            "verified_observations": adaptive.get("observations", 0) if isinstance(adaptive, dict) else 0,
+            "total_verified_outcomes": adaptive.get("total_verified_outcomes", 0) if isinstance(adaptive, dict) else 0,
+        },
+    }
+
+    evaluated = []
+    for action in ("REPLAN", "WAIT", "RETRY", "GATHER_INFORMATION", "REQUEST_HUMAN_HELP"):
+        prediction = predict_outcome(action, environment_state, statistics)
+        evaluated.append({"action": action, "prediction": prediction})
+
+    # M12 compares counterfactual action outcomes. The selector still applies
+    # its existing feasibility and risk gates before any candidate can win.
+    evaluated = rank_candidate_actions(evaluated, environment_state)
+    selected = select_best_action(
+        evaluated,
+        recommended_action=recommendation["recommended_action"],
+    )
+
+    if selected is None:
+        return {
+            "status": "NO_SAFE_ACTION",
+            "reason": (
+                "No candidate action has sufficient historical support "
+                "and passes current safety constraints."
+            ),
+            "original_recommendation": recommendation,
+            "evaluated_actions": evaluated,
+            "visual_evidence": visual_evidence,
+        }
+
+    return {
+        "status": "EVALUATED",
+        "original_recommendation": recommendation,
+        "selected_action": selected["action"],
+        "prediction": selected["prediction"],
+        "evaluated_actions": evaluated,
+        "visual_summary": recommendation.get("visual_summary", ""),
+        "uncertainties": recommendation.get("uncertainties", []),
+        "required_checks": recommendation.get("required_checks", []),
+        "visual_evidence": visual_evidence,
+        "adaptive_learning": {
+            "source": adaptive.get("source", "NO_RUNTIME_HISTORY") if isinstance(adaptive, dict) else "NO_RUNTIME_HISTORY",
+            "diagnosis": adaptive.get("diagnosis", "ALL") if isinstance(adaptive, dict) else "ALL",
+            "verified_observations": adaptive.get("observations", 0) if isinstance(adaptive, dict) else 0,
+            "total_verified_outcomes": adaptive.get("total_verified_outcomes", 0) if isinstance(adaptive, dict) else 0,
+        },
+    }
+
+========== predictive_reasoner.py ==========
+"""M12: transparent counterfactual scoring for candidate recovery actions.
+
+This layer ranks only actions already evaluated by the evidence-based predictor.
+It does not create new capabilities, override feasibility, or weaken risk gates.
+Scores are comparative heuristics, not calibrated real-world probabilities.
+"""
+from __future__ import annotations
+
+ACTION_COST = {
+    "REPLAN": 8.0,
+    "WAIT": 5.0,
+    "RETRY": 10.0,
+    "GATHER_INFORMATION": 6.0,
+    "REQUEST_HUMAN_HELP": 20.0,
+}
+
+
+def assess_candidate(action: str, prediction: dict, environment_state: dict) -> dict:
+    probability = float(prediction.get("success_probability", 0.0))
+    feasible = prediction.get("feasible", False) is not False
+    uncertainty_count = int(prediction.get("visual_uncertainty_count", 0) or 0)
+    evidence_status = prediction.get("visual_evidence_status", "NO_VERIFIED_VISUAL_INPUT")
+
+    # A conservative comparative utility: verified success value minus failure
+    # exposure, execution cost, and unresolved uncertainty.
+    success_value = 100.0 * probability
+    failure_exposure = 45.0 * (1.0 - probability)
+    execution_cost = ACTION_COST.get(action, 25.0)
+    uncertainty_penalty = min(uncertainty_count, 5) * 3.0
+    if evidence_status != "VISUAL_EVIDENCE_ANALYZED":
+        uncertainty_penalty += 8.0
+
+    information_gain = 0.0
+    if action == "GATHER_INFORMATION":
+        # Potential information value only; no claim that the sensor will succeed.
+        information_gain = min(max(uncertainty_count, 1), 3) * 5.0
+
+    utility = success_value - failure_exposure - execution_cost - uncertainty_penalty + information_gain
+    if not feasible:
+        utility = -1000.0
+
+    return {
+        "expected_utility": round(utility, 2),
+        "success_value": round(success_value, 2),
+        "failure_exposure": round(failure_exposure, 2),
+        "execution_cost": execution_cost,
+        "uncertainty_penalty": round(uncertainty_penalty, 2),
+        "potential_information_value": round(information_gain, 2),
+        "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+    }
+
+
+def rank_candidate_actions(evaluated_actions: list[dict], environment_state: dict) -> list[dict]:
+    ranked = []
+    for item in evaluated_actions:
+        enriched = dict(item)
+        prediction = dict(item.get("prediction", {}))
+        prediction["predictive_assessment"] = assess_candidate(
+            item.get("action", ""), prediction, environment_state or {}
+        )
+        enriched["prediction"] = prediction
+        ranked.append(enriched)
+    ranked.sort(
+        key=lambda item: (
+            item["prediction"]["predictive_assessment"]["expected_utility"],
+            item["action"],
+        ),
+        reverse=True,
+    )
+    for index, item in enumerate(ranked, start=1):
+        item["prediction"]["predictive_assessment"]["rank"] = index
+    return ranked
+
+========== outcome_predictor.py ==========
+"""Context-aware recovery outcome estimates from deterministic trial history."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from math import sqrt
+
+ALLOWED_ACTIONS = {
+    "REPLAN",
+    "WAIT",
+    "RETRY",
+    "GATHER_INFORMATION",
+    "REQUEST_HUMAN_HELP",
+}
+
+
+def build_action_statistics(results):
+    statistics = defaultdict(lambda: {"success": 0, "failure": 0})
+
+    for trial in results:
+        for action, succeeded in getattr(trial, "recovery_outcomes", ()):
+            if action in ALLOWED_ACTIONS:
+                statistics[action]["success" if succeeded else "failure"] += 1
+
+    return {action: dict(counts) for action, counts in statistics.items()}
+
+
+def _wilson_lower_bound(successes: int, total: int, z: float = 1.96) -> float:
+    if total <= 0:
+        return 0.0
+
+    p = successes / total
+    denominator = 1 + z * z / total
+    centre = p + z * z / (2 * total)
+    margin = z * sqrt(
+        (p * (1 - p) + z * z / (4 * total)) / total
+    )
+
+    return max(0.0, (centre - margin) / denominator)
+
+
+def predict_outcome(action, environment_state, statistics):
+    """Return a conservative estimate with feasibility and evidence."""
+
+    if action not in ALLOWED_ACTIONS:
+        return {
+            "success_probability": 0.0,
+            "lower_confidence_bound": 0.0,
+            "risk_level": "HIGH",
+            "expected_result": "Unsupported action.",
+            "observations": 0,
+            "feasible": False,
+        }
+
+    state = environment_state or {}
+
+    feasible = True
+    constraint = "No immediate constraint detected."
+
+    # Existing navigation safety constraints.
+    if action == "REPLAN" and not state.get("safe_alternative_route", False):
+        feasible = False
+        constraint = "No safe alternative route is confirmed."
+
+    elif action == "RETRY" and state.get("path_blocked", False):
+        feasible = False
+        constraint = "The target path is still blocked; retry is unsafe."
+
+    elif action == "WAIT" and not state.get(
+        "temporary_obstacle",
+        state.get("obstacle_temporary", False),
+    ):
+        constraint = "No temporary-obstacle evidence; waiting benefit is uncertain."
+
+    elif action == "REQUEST_HUMAN_HELP":
+        constraint = "Safe escalation option; it does not autonomously restore progress."
+
+    # Inspect structured visual evidence.
+    visual_evidence = state.get("visual_evidence", {})
+
+    if not isinstance(visual_evidence, dict):
+        visual_evidence = {}
+
+    evidence_status = visual_evidence.get(
+        "evidence_status",
+        "NO_VERIFIED_VISUAL_INPUT",
+    )
+
+    uncertainties = visual_evidence.get("uncertainties", [])
+
+    if not isinstance(uncertainties, list):
+        uncertainties = []
+
+    analysis_completed = evidence_status == "VISUAL_EVIDENCE_ANALYZED"
+
+    visual_warning = ""
+
+    if not analysis_completed:
+        visual_warning = " Visual analysis is unavailable or incomplete."
+
+    elif uncertainties:
+        visual_warning = (
+            f" Visual analysis contains {len(uncertainties)} unresolved uncertainties."
+        )
+
+    # Action-specific uncertainty handling.
+    uncertainty_reason = ""
+
+    if uncertainties or not analysis_completed:
+
+        if action == "RETRY":
+            if not state.get("path_blocked", False):
+                feasible = False
+                uncertainty_reason = (
+                    "Retry requires sufficient environmental evidence "
+                    "to confirm that the path is clear."
+                )
+
+        elif action == "REPLAN":
+            if not state.get("safe_alternative_route", False):
+                feasible = False
+                uncertainty_reason = (
+                    "Replanning requires a confirmed safe alternative route."
+                )
+
+        elif action == "WAIT":
+            if not state.get(
+                "temporary_obstacle",
+                state.get("obstacle_temporary", False),
+            ):
+                uncertainty_reason = (
+                    "Waiting may be appropriate, but temporary-obstacle "
+                    "evidence is missing."
+                )
+
+        elif action == "GATHER_INFORMATION":
+            uncertainty_reason = (
+                "Gather information to reduce uncertainty before acting."
+            )
+
+        elif action == "REQUEST_HUMAN_HELP":
+            uncertainty_reason = (
+                "Human assistance remains available despite visual uncertainty."
+            )
+
+    # Historical statistics remain independent of visual evidence.
+    counts = statistics.get(action, {})
+
+    successes = int(counts.get("success", 0))
+    failures = int(counts.get("failure", 0))
+    total = successes + failures
+
+    if total == 0:
+        probability = 0.5
+        lower = 0.0
+        risk = "UNKNOWN"
+
+        expected = (
+            "No historical observations; probability is an uninformative "
+            "prior, not evidence."
+        )
+
+    else:
+        probability = (successes + 1) / (total + 2)
+        lower = _wilson_lower_bound(successes, total)
+
+        risk = (
+            "LOW" if lower >= 0.60
+            else "MEDIUM" if lower >= 0.30
+            else "HIGH"
+        )
+
+        expected = (
+            f"Historical estimate from {total} observations "
+            f"({successes} successes, {failures} failures)."
+        )
+
+    # Reject actions that violate safety constraints.
+    if not feasible:
+        risk = "HIGH"
+        probability = 0.0
+        lower = 0.0
+
+    return {
+        "success_probability": round(probability, 3),
+        "lower_confidence_bound": round(lower, 3),
+        "risk_level": risk,
+        "expected_result": (
+            f"{expected} {constraint} {visual_warning} {uncertainty_reason}"
+        ),
+        "observations": total,
+        "feasible": feasible,
+        "visual_evidence_status": evidence_status,
+        "visual_uncertainty_count": len(uncertainties),
+        "uncertainty_reason": uncertainty_reason,
+    }
+
+========== adaptive_learning.py ==========
+"""Persistent, verified adaptive outcome memory for REROUTE (M11).
+
+Only terminal, verified outcomes are stored. The JSON store is local to this
+machine, versioned, bounded, and written atomically. Set REROUTE_MEMORY_PATH
+to choose a different location; set REROUTE_DISABLE_PERSISTENCE=1 for
+ephemeral test/demo sessions.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+import json
+import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Iterable
+
+from outcome_verifier import VerificationState
+
+_SCHEMA_VERSION = 1
+_MAX_ATTEMPTS = 5000
+
+
+def _state_values(record) -> set[str]:
+    return {getattr(state, "value", str(state)) for state in getattr(record, "verification_states", ())}
+
+
+class AdaptiveOutcomeMemory:
+    """Accumulate verified outcomes and optionally retain them across restarts."""
+
+    def __init__(self, storage_path: str | os.PathLike | None = None, persistent: bool = False) -> None:
+        if os.environ.get("REROUTE_DISABLE_PERSISTENCE") == "1":
+            persistent = False
+        if storage_path is None and persistent:
+            storage_path = os.environ.get(
+                "REROUTE_MEMORY_PATH",
+                str(Path.home() / ".reroute" / "adaptive_memory.json"),
+            )
+        self.storage_path = Path(storage_path).expanduser() if storage_path else None
+        self._counts = defaultdict(lambda: {"success": 0, "failure": 0})
+        self._seen_attempts: set[str] = set()
+        self._total_ingested = 0
+        if self.storage_path:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            payload = json.loads(self.storage_path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != _SCHEMA_VERSION:
+                return
+            counts = payload.get("counts", {})
+            if not isinstance(counts, dict):
+                return
+            for cause, actions in counts.items():
+                if not isinstance(actions, dict):
+                    continue
+                for action, values in actions.items():
+                    if not isinstance(values, dict):
+                        continue
+                    success, failure = values.get("success", 0), values.get("failure", 0)
+                    if all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (success, failure)):
+                        self._counts[(str(cause), str(action))] = {"success": success, "failure": failure}
+            attempts = payload.get("seen_attempts", [])
+            if isinstance(attempts, list):
+                self._seen_attempts = {str(x) for x in attempts[-_MAX_ATTEMPTS:] if isinstance(x, str)}
+            total = payload.get("total_verified_outcomes", 0)
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                self._total_ingested = total
+        except (OSError, ValueError, TypeError, AttributeError):
+            # Corrupt/unavailable history must never prevent safe operation.
+            return
+
+    def _save(self) -> None:
+        if not self.storage_path:
+            return
+        grouped = {}
+        for (cause, action), values in self._counts.items():
+            grouped.setdefault(cause, {})[action] = dict(values)
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "total_verified_outcomes": self._total_ingested,
+            "seen_attempts": sorted(self._seen_attempts)[-_MAX_ATTEMPTS:],
+            "counts": grouped,
+        }
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile("w", encoding="utf-8", dir=self.storage_path.parent, delete=False) as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary = Path(handle.name)
+            os.replace(temporary, self.storage_path)
+        except OSError:
+            # Persistence is best-effort; the in-memory controller remains usable.
+            try:
+                temporary.unlink(missing_ok=True)
+            except (UnboundLocalError, OSError):
+                pass
+
+    def ingest(self, records: Iterable[object]) -> int:
+        added = 0
+        for record in records:
+            attempt_id = getattr(record, "attempt_id", "")
+            if not attempt_id or attempt_id in self._seen_attempts:
+                continue
+            action = getattr(getattr(record, "decision", None), "action", None)
+            action = getattr(action, "value", str(action))
+            if action == "REQUEST_HUMAN_HELP":
+                continue
+            states = _state_values(record)
+            cause = getattr(getattr(record, "diagnosis", None), "cause", "UNKNOWN")
+            cause = getattr(cause, "value", str(cause))
+            outcome = None
+            if VerificationState.RECOVERY_FAILED.value in states:
+                outcome = "failure"
+            elif action == "GATHER_INFORMATION" and VerificationState.OBSERVATION_REFRESHED.value in states:
+                outcome = "success"
+            elif action == "WAIT" and VerificationState.ENVIRONMENT_CHANGED.value in states:
+                outcome = "success"
+            elif VerificationState.PROGRESS_RESTORED.value in states or VerificationState.TASK_COMPLETED.value in states:
+                outcome = "success"
+            elif getattr(record, "succeeded", None) is False:
+                outcome = "failure"
+            if outcome is None:
+                continue
+            self._counts[("ALL", action)][outcome] += 1
+            self._counts[(cause, action)][outcome] += 1
+            self._seen_attempts.add(str(attempt_id))
+            self._total_ingested += 1
+            added += 1
+        if added:
+            if len(self._seen_attempts) > _MAX_ATTEMPTS:
+                self._seen_attempts = set(sorted(self._seen_attempts)[-_MAX_ATTEMPTS:])
+            self._save()
+        return added
+
+    def snapshot(self, diagnosis: str | None = None) -> dict:
+        key_prefix = diagnosis if diagnosis else "ALL"
+        counts = {action: dict(values) for (cause, action), values in self._counts.items() if cause == key_prefix}
+        return {
+            "source": "PERSISTENT_VERIFIED_RUNTIME_OUTCOMES" if self.storage_path else "VERIFIED_RUNTIME_OUTCOMES",
+            "diagnosis": diagnosis or "ALL",
+            "action_statistics": counts,
+            "observations": sum(v["success"] + v["failure"] for v in counts.values()),
+            "total_verified_outcomes": self._total_ingested,
+            "persistence_enabled": self.storage_path is not None,
+        }
+
+    @property
+    def total_verified_outcomes(self) -> int:
+        return self._total_ingested
+
+========== test_adaptive_learning.py ==========
+"""Tests for verified, diagnosis-aware adaptive outcome memory."""
+import unittest
+from types import SimpleNamespace
+
+from adaptive_learning import AdaptiveOutcomeMemory
+from outcome_verifier import VerificationState
+
+
+def record(attempt, action, cause="TEMPORARY_OBSTACLE", states=(), succeeded=True):
+    return SimpleNamespace(
+        attempt_id=attempt,
+        decision=SimpleNamespace(action=action),
+        diagnosis=SimpleNamespace(cause=cause),
+        verification_states=tuple(states),
+        succeeded=succeeded,
+    )
+
+
+class AdaptiveLearningTests(unittest.TestCase):
+    def test_unverified_attempt_is_not_learned(self):
+        memory = AdaptiveOutcomeMemory()
+        pending = record("r1", "REPLAN")
+        self.assertEqual(memory.ingest([pending]), 0)
+        self.assertEqual(memory.total_verified_outcomes, 0)
+
+    def test_progress_restoration_is_learned_and_deduplicated(self):
+        memory = AdaptiveOutcomeMemory()
+        completed = record(
+            "r1", "REPLAN",
+            states=(VerificationState.ACTION_EXECUTED, VerificationState.PROGRESS_RESTORED),
+        )
+        self.assertEqual(memory.ingest([completed]), 1)
+        self.assertEqual(memory.ingest([completed]), 0)
+        stats = memory.snapshot("TEMPORARY_OBSTACLE")["action_statistics"]
+        self.assertEqual(stats["REPLAN"], {"success": 1, "failure": 0})
+
+    def test_gather_information_requires_actual_observation_refresh(self):
+        memory = AdaptiveOutcomeMemory()
+        failed_observation = record("r1", "GATHER_INFORMATION")
+        refreshed = record(
+            "r2", "GATHER_INFORMATION",
+            states=(VerificationState.ACTION_EXECUTED, VerificationState.OBSERVATION_REFRESHED),
+        )
+        self.assertEqual(memory.ingest([failed_observation, refreshed]), 1)
+        stats = memory.snapshot("TEMPORARY_OBSTACLE")["action_statistics"]
+        self.assertEqual(stats["GATHER_INFORMATION"], {"success": 1, "failure": 0})
+
+    def test_failure_is_learned_but_human_escalation_is_not(self):
+        memory = AdaptiveOutcomeMemory()
+        failed = record("r1", "RETRY", states=(VerificationState.RECOVERY_FAILED,), succeeded=False)
+        human = record("r2", "REQUEST_HUMAN_HELP", states=(VerificationState.RECOVERY_FAILED,), succeeded=False)
+        self.assertEqual(memory.ingest([failed, human]), 1)
+        self.assertEqual(memory.snapshot("TEMPORARY_OBSTACLE")["action_statistics"]["RETRY"], {"success": 0, "failure": 1})
+
+    def test_verified_success_and_failure_change_action_risk_estimate(self):
+        from outcome_predictor import predict_outcome
+
+        successful_memory = AdaptiveOutcomeMemory()
+        failed_memory = AdaptiveOutcomeMemory()
+        successes = [
+            record(f"s{i}", "WAIT", states=(VerificationState.ENVIRONMENT_CHANGED,))
+            for i in range(8)
+        ]
+        failures = [
+            record(f"f{i}", "WAIT", states=(VerificationState.RECOVERY_FAILED,), succeeded=False)
+            for i in range(8)
+        ]
+        successful_memory.ingest(successes)
+        failed_memory.ingest(failures)
+
+        state = {"temporary_obstacle": True}
+        success_prediction = predict_outcome(
+            "WAIT", state,
+            successful_memory.snapshot("TEMPORARY_OBSTACLE")["action_statistics"],
+        )
+        failure_prediction = predict_outcome(
+            "WAIT", state,
+            failed_memory.snapshot("TEMPORARY_OBSTACLE")["action_statistics"],
+        )
+        self.assertEqual(success_prediction["risk_level"], "LOW")
+        self.assertEqual(failure_prediction["risk_level"], "HIGH")
+
+    def test_pipeline_includes_runtime_evidence_without_bypassing_safety(self):
+        from unittest.mock import patch
+        from decision_pipeline import run_decision_pipeline
+
+        recommendation = {
+            "recommended_action": "WAIT",
+            "reason": "A temporary obstacle may clear.",
+            "confidence": 0.8,
+            "required_checks": ["Recheck the obstacle after waiting."],
+            "alternative_action": "GATHER_INFORMATION",
+            "visual_summary": "",
+            "uncertainties": [],
+        }
+        context = {
+            "temporary_obstacle": True,
+            "adaptive_learning": {
+                "source": "VERIFIED_RUNTIME_OUTCOMES",
+                "diagnosis": "TEMPORARY_OBSTACLE",
+                "observations": 3,
+                "total_verified_outcomes": 3,
+                "action_statistics": {"WAIT": {"success": 3, "failure": 0}},
+            },
+        }
+        baseline = {"WAIT": {"success": 2, "failure": 1}}
+        with patch("decision_pipeline._historical_action_statistics", return_value=baseline):
+            result = run_decision_pipeline(context, recommendation_provider=lambda _: recommendation)
+
+        wait_prediction = next(
+            item["prediction"] for item in result["evaluated_actions"]
+            if item["action"] == "WAIT"
+        )
+        self.assertEqual(wait_prediction["observations"], 6)
+        self.assertEqual(result["adaptive_learning"]["verified_observations"], 3)
+        # Adaptive statistics are evidence only: infeasible actions stay infeasible.
+        self.assertFalse(next(
+            item["prediction"]["feasible"] for item in result["evaluated_actions"]
+            if item["action"] == "REPLAN"
+        ))
+
+    def test_diagnosis_snapshots_are_separated(self):
+        memory = AdaptiveOutcomeMemory()
+        memory.ingest([
+            record("r1", "WAIT", "TEMPORARY_OBSTACLE", (VerificationState.ENVIRONMENT_CHANGED,)),
+            record("r2", "RETRY", "REPEATED_FAILURE", (VerificationState.PROGRESS_RESTORED,)),
+        ])
+        self.assertIn("WAIT", memory.snapshot("TEMPORARY_OBSTACLE")["action_statistics"])
+        self.assertNotIn("WAIT", memory.snapshot("REPEATED_FAILURE")["action_statistics"])
+
+
+    def test_verified_memory_persists_across_instances(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.json"
+            first = AdaptiveOutcomeMemory(storage_path=path, persistent=True)
+            completed = record(
+                "persist-1", "REPLAN",
+                states=(VerificationState.ACTION_EXECUTED, VerificationState.PROGRESS_RESTORED),
+            )
+            self.assertEqual(first.ingest([completed]), 1)
+            second = AdaptiveOutcomeMemory(storage_path=path, persistent=True)
+            snapshot = second.snapshot("TEMPORARY_OBSTACLE")
+            self.assertEqual(snapshot["action_statistics"]["REPLAN"], {"success": 1, "failure": 0})
+            self.assertEqual(second.ingest([completed]), 0)
+
+    def test_predictive_reasoner_scores_candidates_without_changing_feasibility(self):
+        from predictive_reasoner import rank_candidate_actions
+
+        candidates = [
+            {"action": "REPLAN", "prediction": {
+                "success_probability": 0.8, "feasible": True,
+                "visual_uncertainty_count": 1,
+                "visual_evidence_status": "VISUAL_EVIDENCE_ANALYZED",
+            }},
+            {"action": "RETRY", "prediction": {
+                "success_probability": 0.9, "feasible": False,
+                "visual_uncertainty_count": 1,
+                "visual_evidence_status": "VISUAL_EVIDENCE_ANALYZED",
+            }},
+        ]
+        ranked = rank_candidate_actions(candidates, {})
+        retry = next(x for x in ranked if x["action"] == "RETRY")
+        self.assertEqual(retry["prediction"]["predictive_assessment"]["expected_utility"], -1000.0)
+        self.assertFalse(retry["prediction"]["feasible"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+========== ALL M12 REFERENCES ==========
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\decision_pipeline.py:12: from predictive_reasoner import rank_candidate_actions
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\decision_pipeline.py:94:     evaluated = rank_candidate_actions(evaluated, environment_state)
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\decision_selector.py:70:             -item["prediction"].get("predictive_assessment", {}).get("expected_utility", 0.0),
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\predictive_reasoner.py:18: def assess_candidate(action: str, prediction: dict, environment_state: dict) -> dict:
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\predictive_reasoner.py:43:         "expected_utility": round(utility, 2),
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\predictive_reasoner.py:53: def rank_candidate_actions(evaluated_actions: list[dict], environment_state: dict) -> list[dict]:
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\predictive_reasoner.py:58:         prediction["predictive_assessment"] = assess_candidate(
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\predictive_reasoner.py:65:             item["prediction"]["predictive_assessment"]["expected_utility"],
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\predictive_reasoner.py:71:         item["prediction"]["predictive_assessment"]["rank"] = index
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\test_adaptive_learning.py:149:     def test_predictive_reasoner_scores_candidates_without_changing_feasibility(self):
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\test_adaptive_learning.py:150:         from predictive_reasoner import rank_candidate_actions
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\test_adaptive_learning.py:164:         ranked = rank_candidate_actions(candidates, {})
+C:\Users\sv660\OneDrive\Documents\reroute_final\REROUTE_Final_Integrated_Build\reroute_final_build\test_adaptive_learning.py:166:         self.assertEqual(retry["prediction"]["predictive_assessment"]["expected_utility"], -1000.0)

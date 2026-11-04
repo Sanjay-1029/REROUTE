@@ -1,0 +1,222 @@
+{
+    "project": "REROUTE",
+    "milestone": "M14 - PyBullet Simulator Integration",
+    "simulator": "PyBullet",
+    "agent": "AutonomousAgent",
+    "planner": "A*",
+    "recovery_mode": "M11",
+    "decision_provider": "Offline REROUTE decision pipeline",
+    "goal_reached": true,
+    "result_reason": "goal_reached",
+    "final_position": [
+        9,
+        9
+    ],
+    "successful_moves": 18,
+    "failed_moves": 0,
+    "recovery_events": 0,
+    "elapsed_seconds": 27.17,
+    "initial_sensors": {
+        "front": 2.0,
+        "front_right": 2.0,
+        "right": 2.0,
+        "back_right": 2.0,
+        "back": 2.0,
+        "back_left": 2.0,
+        "left": 2.0,
+        "front_left": 2.0
+    },
+    "final_sensors": {
+        "front": 2.0,
+        "front_right": 2.0,
+        "right": 2.0,
+        "back_right": 2.0,
+        "back": 2.0,
+        "back_left": 2.0,
+        "left": 2.0,
+        "front_left": 2.0
+    },
+    "movement_history": [
+        {
+            "step": 1,
+            "direction": "down",
+            "position": [
+                0,
+                1
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 2,
+            "direction": "down",
+            "position": [
+                0,
+                2
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 3,
+            "direction": "down",
+            "position": [
+                0,
+                3
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 4,
+            "direction": "down",
+            "position": [
+                0,
+                4
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 5,
+            "direction": "down",
+            "position": [
+                0,
+                5
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 6,
+            "direction": "down",
+            "position": [
+                0,
+                6
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 7,
+            "direction": "down",
+            "position": [
+                0,
+                7
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 8,
+            "direction": "down",
+            "position": [
+                0,
+                8
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 9,
+            "direction": "down",
+            "position": [
+                0,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 10,
+            "direction": "right",
+            "position": [
+                1,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 11,
+            "direction": "right",
+            "position": [
+                2,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 12,
+            "direction": "right",
+            "position": [
+                3,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 13,
+            "direction": "right",
+            "position": [
+                4,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 14,
+            "direction": "right",
+            "position": [
+                5,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 15,
+            "direction": "right",
+            "position": [
+                6,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 16,
+            "direction": "right",
+            "position": [
+                7,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 17,
+            "direction": "right",
+            "position": [
+                8,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        },
+        {
+            "step": 18,
+            "direction": "right",
+            "position": [
+                9,
+                9
+            ],
+            "success": true,
+            "reason": "moved"
+        }
+    ],
+    "status": "PASSED"
+}

@@ -1,0 +1,208 @@
+{
+    "project": "REROUTE",
+    "demonstration": "PyBullet + Muse Spark",
+    "mode": "OFFLINE",
+    "model": "OFFLINE MOCK",
+    "maximum_live_requests": 1,
+    "decision_pipeline_results": [
+        {
+            "status": "EVALUATED",
+            "original_recommendation": {
+                "recommended_action": "REPLAN",
+                "reason": "Offline test recommendation based on supplied environment state.",
+                "confidence": 0.8,
+                "required_checks": [
+                    "Verify the selected action against the current environment."
+                ],
+                "alternative_action": "GATHER_INFORMATION",
+                "visual_summary": "Offline provider; no image was sent to Muse Spark.",
+                "uncertainties": [
+                    "This is a mock recommendation, not a model response."
+                ]
+            },
+            "selected_action": "REPLAN",
+            "prediction": {
+                "success_probability": 0.875,
+                "lower_confidence_bound": 0.61,
+                "risk_level": "LOW",
+                "expected_result": "Historical estimate from 6 observations (6 successes, 0 failures). No immediate constraint detected.  Visual analysis is unavailable or incomplete. ",
+                "observations": 6,
+                "feasible": true,
+                "visual_evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                "visual_uncertainty_count": 1,
+                "uncertainty_reason": "",
+                "predictive_assessment": {
+                    "expected_utility": 62.88,
+                    "success_value": 87.5,
+                    "failure_exposure": 5.62,
+                    "execution_cost": 8.0,
+                    "uncertainty_penalty": 11.0,
+                    "potential_information_value": 0.0,
+                    "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+                    "rank": 1
+                }
+            },
+            "evaluated_actions": [
+                {
+                    "action": "REPLAN",
+                    "prediction": {
+                        "success_probability": 0.875,
+                        "lower_confidence_bound": 0.61,
+                        "risk_level": "LOW",
+                        "expected_result": "Historical estimate from 6 observations (6 successes, 0 failures). No immediate constraint detected.  Visual analysis is unavailable or incomplete. ",
+                        "observations": 6,
+                        "feasible": true,
+                        "visual_evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                        "visual_uncertainty_count": 1,
+                        "uncertainty_reason": "",
+                        "predictive_assessment": {
+                            "expected_utility": 62.88,
+                            "success_value": 87.5,
+                            "failure_exposure": 5.62,
+                            "execution_cost": 8.0,
+                            "uncertainty_penalty": 11.0,
+                            "potential_information_value": 0.0,
+                            "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+                            "rank": 1
+                        }
+                    }
+                },
+                {
+                    "action": "WAIT",
+                    "prediction": {
+                        "success_probability": 0.8,
+                        "lower_confidence_bound": 0.438,
+                        "risk_level": "MEDIUM",
+                        "expected_result": "Historical estimate from 3 observations (3 successes, 0 failures). No temporary-obstacle evidence; waiting benefit is uncertain.  Visual analysis is unavailable or incomplete. Waiting may be appropriate, but temporary-obstacle evidence is missing.",
+                        "observations": 3,
+                        "feasible": true,
+                        "visual_evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                        "visual_uncertainty_count": 1,
+                        "uncertainty_reason": "Waiting may be appropriate, but temporary-obstacle evidence is missing.",
+                        "predictive_assessment": {
+                            "expected_utility": 55.0,
+                            "success_value": 80.0,
+                            "failure_exposure": 9.0,
+                            "execution_cost": 5.0,
+                            "uncertainty_penalty": 11.0,
+                            "potential_information_value": 0.0,
+                            "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+                            "rank": 2
+                        }
+                    }
+                },
+                {
+                    "action": "GATHER_INFORMATION",
+                    "prediction": {
+                        "success_probability": 0.5,
+                        "lower_confidence_bound": 0.0,
+                        "risk_level": "UNKNOWN",
+                        "expected_result": "No historical observations; probability is an uninformative prior, not evidence. No immediate constraint detected.  Visual analysis is unavailable or incomplete. Gather information to reduce uncertainty before acting.",
+                        "observations": 0,
+                        "feasible": true,
+                        "visual_evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                        "visual_uncertainty_count": 1,
+                        "uncertainty_reason": "Gather information to reduce uncertainty before acting.",
+                        "predictive_assessment": {
+                            "expected_utility": 15.5,
+                            "success_value": 50.0,
+                            "failure_exposure": 22.5,
+                            "execution_cost": 6.0,
+                            "uncertainty_penalty": 11.0,
+                            "potential_information_value": 5.0,
+                            "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+                            "rank": 3
+                        }
+                    }
+                },
+                {
+                    "action": "REQUEST_HUMAN_HELP",
+                    "prediction": {
+                        "success_probability": 0.2,
+                        "lower_confidence_bound": 0.0,
+                        "risk_level": "HIGH",
+                        "expected_result": "Historical estimate from 3 observations (0 successes, 3 failures). Safe escalation option; it does not autonomously restore progress.  Visual analysis is unavailable or incomplete. Human assistance remains available despite visual uncertainty.",
+                        "observations": 3,
+                        "feasible": true,
+                        "visual_evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                        "visual_uncertainty_count": 1,
+                        "uncertainty_reason": "Human assistance remains available despite visual uncertainty.",
+                        "predictive_assessment": {
+                            "expected_utility": -47.0,
+                            "success_value": 20.0,
+                            "failure_exposure": 36.0,
+                            "execution_cost": 20.0,
+                            "uncertainty_penalty": 11.0,
+                            "potential_information_value": 0.0,
+                            "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+                            "rank": 4
+                        }
+                    }
+                },
+                {
+                    "action": "RETRY",
+                    "prediction": {
+                        "success_probability": 0.0,
+                        "lower_confidence_bound": 0.0,
+                        "risk_level": "HIGH",
+                        "expected_result": "Historical estimate from 6 observations (6 successes, 0 failures). The target path is still blocked; retry is unsafe.  Visual analysis is unavailable or incomplete. ",
+                        "observations": 6,
+                        "feasible": false,
+                        "visual_evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                        "visual_uncertainty_count": 1,
+                        "uncertainty_reason": "",
+                        "predictive_assessment": {
+                            "expected_utility": -1000.0,
+                            "success_value": 0.0,
+                            "failure_exposure": 45.0,
+                            "execution_cost": 10.0,
+                            "uncertainty_penalty": 11.0,
+                            "potential_information_value": 0.0,
+                            "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+                            "rank": 5
+                        }
+                    }
+                }
+            ],
+            "visual_summary": "Offline provider; no image was sent to Muse Spark.",
+            "uncertainties": [
+                "This is a mock recommendation, not a model response."
+            ],
+            "required_checks": [
+                "Verify the selected action against the current environment."
+            ],
+            "visual_evidence": {
+                "image_available": false,
+                "analysis_completed": false,
+                "observation_count": 0,
+                "observations": [],
+                "uncertainties": [
+                    "This is a mock recommendation, not a model response."
+                ],
+                "evidence_status": "NO_VERIFIED_VISUAL_INPUT",
+                "navigation_coordinates_verified": false
+            },
+            "adaptive_learning": {
+                "source": "VERIFIED_RUNTIME_OUTCOMES",
+                "diagnosis": "INSUFFICIENT_INFORMATION",
+                "verified_observations": 0,
+                "total_verified_outcomes": 0
+            }
+        }
+    ],
+    "status": "PASSED",
+    "goal_reached": true,
+    "reason": "goal_reached",
+    "final_position": [
+        9,
+        9
+    ],
+    "successful_moves": 18,
+    "failed_moves": 1,
+    "recovery_events": 1,
+    "live_request_attempted": false,
+    "elapsed_seconds": 27.01,
+    "recoveries": [
+        "RecoveryRecord(diagnosis=DiagnosisRecord(failure=FailureRecord(failure_type=<FailureType.MOVEMENT_BLOCKED: 'MOVEMENT_BLOCKED'>, tick=1, agent_position=(0, 0), expected_position=(0, 1), environment={'width': 10, 'height': 10, 'agent_position': (0, 0), 'goal_position': (9, 9), 'obstacles': ((2, 0), (2, 1), (2, 2), (4, 4), (4, 5), (4, 6), (6, 7), (7, 7), (8, 7)), 'tick': 1, 'state_version': 1, 'expected_position_obstacle': {'present': False, 'kind': None, 'temporary': False, 'remaining_duration': None}}, evidence='Movement was rejected: transient_failure.', severity=<Severity.ERROR: 'error'>, temporary=False), cause=<DiagnosisCause.INSUFFICIENT_INFORMATION: 'INSUFFICIENT_INFORMATION'>, confidence=0.3, supporting_evidence=('Movement was rejected: transient_failure.',), missing_or_contradicting_evidence=('Available evidence does not distinguish obstacle, action, or state causes.',), recommended_next_investigation='Gather another state snapshot and movement observation.', human_intervention_may_be_needed=True), decision=RecoveryDecision(action=<RecoveryAction.REPLAN: 'REPLAN'>, reason='Decision pipeline recommendation'), attempt=1, execution_result='alternative_route_available', succeeded=True, ticks_spent=0, attempt_id='recovery-001', start_tick=1, end_tick=1, affected_route_nodes=((0, 1),), observation_versions=(1, 1), verification_states=(<VerificationState.ACTION_EXECUTED: 'ACTION_EXECUTED'>, <VerificationState.PROGRESS_RESTORED: 'PROGRESS_RESTORED'>, <VerificationState.TASK_COMPLETED: 'TASK_COMPLETED'>), verification_evidence=('alternative_route_available', 'Navigation resumed with verified movement to (0, 1).', 'Agent position equals the goal position.'))"
+    ]
+}

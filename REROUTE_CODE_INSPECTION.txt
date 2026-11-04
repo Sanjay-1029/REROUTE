@@ -1,0 +1,2658 @@
+﻿
+
+==================================================
+FILE: agent.py
+==================================================
+"""Autonomous route planning and verified movement execution for REROUTE."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import base64
+import os
+import time
+from typing import Any, Callable
+
+from environment import Environment, MoveResult, Position
+from diagnosis import FailureDiagnosis
+from failure_detector import FailureDetector, FailureRecord
+from pathfinder import SearchResult, astar_search, bfs_search
+from recovery import RecoveryAction, RecoveryEngine, RecoveryRecord
+from outcome_verifier import VerificationState
+from adaptive_learning import AdaptiveOutcomeMemory
+from recovery import RecoveryDecision, RecoveryAction
+
+
+
+@dataclass(frozen=True)
+class ActionRecord:
+    step: int
+    direction: str | None
+    expected_position: Position | None
+    actual_position: Position
+    succeeded: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class AgentEvent:
+    """A copy-safe observation emitted for dashboards and other observers."""
+
+    activity: str
+    tick: int
+    state_version: int
+    payload: dict[str, Any]
+
+
+class AgentExecutionCancelled(Exception):
+    """Raised by an observer that intentionally stops a live simulation."""
+
+
+@dataclass
+class AgentRunResult:
+    reached_goal: bool
+    reason: str
+    planned_route: list[list[int]] | None
+    actions: list[ActionRecord] = field(default_factory=list)
+    invalidated_positions: list[Position] = field(default_factory=list)
+    failures: list[FailureRecord] = field(default_factory=list)
+    recoveries: list[RecoveryRecord] = field(default_factory=list)
+
+    @property
+    def successful_moves(self) -> int:
+        return sum(action.succeeded for action in self.actions)
+
+    @property
+    def failed_moves(self) -> int:
+        return len(self.actions) - self.successful_moves
+
+
+class AutonomousAgent:
+    """Plans with BFS/A* and terminates safely when verified progress stops."""
+
+    _DIRECTION_FOR_DELTA = {(0, -1): "up", (0, 1): "down", (-1, 0): "left", (1, 0): "right"}
+
+    def __init__(
+        self,
+        environment: Environment,
+        algorithm: str = "astar",
+        logger: Callable[[str], None] = print,
+        max_recovery_attempts: int = 3,
+        recovery_enabled: bool = True,
+        recovery_mode: str = "m9",
+        max_wait_ticks: int = 5,
+        event_callback: Callable[[AgentEvent], bool | None] | None = None,
+        decision_policy: Callable[[dict], dict] | None = None,
+        vision_engine: Any | None = None,
+        image_provider: Callable[[], Any] | None = None,
+        adaptive_memory: AdaptiveOutcomeMemory | None = None,
+    ) -> None:
+        if algorithm not in {"bfs", "astar"}:
+            raise ValueError("algorithm must be 'bfs' or 'astar'.")
+        if recovery_mode not in {"m9", "m11"}:
+            raise ValueError("recovery_mode must be 'm9' or 'm11'.")
+        self.environment = environment
+        self.algorithm = algorithm
+        self.logger = logger
+        self.route: list[list[int]] | None = None
+        self.actions: list[ActionRecord] = []
+        self.invalidated_positions: list[Position] = []
+        self.failure_detector = FailureDetector()
+        self.diagnosis_engine = FailureDiagnosis()
+        self.recovery_engine = RecoveryEngine(max_recovery_attempts)
+        self.recovery_enabled = recovery_enabled
+        self.recovery_mode = recovery_mode
+        self.max_wait_ticks = max_wait_ticks
+        self._pending_recoveries: list[str] = []
+        self._movement_limit = 0
+        self.event_callback = event_callback
+        self.decision_policy = decision_policy
+        self.vision_engine = vision_engine
+        self.image_provider = image_provider
+        self.adaptive_memory = adaptive_memory or AdaptiveOutcomeMemory()
+        self.alternative_route: list[list[int]] | None = None
+        self.last_visual_context: dict[str, Any] = {}
+        self.visual_observation_history: list[dict[str, Any]] = []
+
+    def plan_route(self) -> SearchResult:
+        """Read a fresh environment snapshot and plan from the actual position."""
+        self._emit("OBSERVING")
+        state = self.environment.get_state()
+        search = astar_search if self.algorithm == "astar" else bfs_search
+        result = search(
+            state["agent_position"], state["goal_position"], state["obstacles"],
+            state["width"], state["height"],
+        )
+        self.route = result.path
+        self._emit("PLANNING", algorithm=result.algorithm, nodes_explored=result.explored_nodes, path_length=result.steps)
+        if result.path:
+            self._log(f"PLAN {result.algorithm}: {result.steps} steps, {result.explored_nodes} nodes explored.")
+        else:
+            self._log(f"PLAN {result.algorithm}: no route available.")
+        return result
+
+    def run(self, max_steps: int | None = None) -> AgentRunResult:
+        """Execute verified routes and bounded, diagnosis-driven recovery actions."""
+        self.actions = []
+        self.invalidated_positions = []
+        self.failure_detector = FailureDetector()
+        self.diagnosis_engine = FailureDiagnosis()
+        self.recovery_engine = RecoveryEngine(self.recovery_engine.max_attempts)
+        self._pending_recoveries = []
+        self.last_visual_context = {}
+        self.visual_observation_history = []
+        state = self.environment.get_state()
+        if state["agent_position"] == state["goal_position"]:
+            self.failure_detector.observe_goal_reached(self.environment)
+            self._log("GOAL already reached.")
+            self._emit("GOAL_REACHED")
+            return self._result(True, "goal_reached")
+
+        limit = max_steps if max_steps is not None else state["width"] * state["height"]
+        self._movement_limit = limit
+        while len(self.actions) < limit:
+            search_result = self.plan_route()
+            if not search_result.path:
+                failure = self.failure_detector.observe_no_route(self.environment)
+                if not self.recovery_enabled:
+                    return self._result(False, "no_route")
+                if not self._recover(failure, None):
+                    return self._result(False, "no_route")
+                continue
+            recovery_needed = False
+            for index in range(1, len(search_result.path)):
+                if len(self.actions) >= limit:
+                    return self._result(False, "step_limit_reached")
+                self.environment.advance()
+                blocked = self._blocked_route_positions(search_result.path[index:])
+                if blocked:
+                    self.invalidated_positions = blocked
+                    failure = self.failure_detector.observe_route_outdated(self.environment, blocked)
+                    self._emit("FAILURE_DETECTED", failure=failure, affected_nodes=blocked)
+                    self._log(f"ROUTE OUTDATED: obstacle(s) now occupy {blocked}.")
+                    if not self.recovery_enabled:
+                        return self._result(False, "route_outdated")
+                    if not self._recover(failure, tuple(search_result.path[index])):
+                        return self._result(False, "route_outdated")
+                    recovery_needed = True
+                    break
+                record = self.execute_next(search_result.path[index])
+                if not record.succeeded:
+                    failure = self.failure_detector.history[-1]
+                    self._emit("FAILURE_DETECTED", failure=failure)
+                    if not self.recovery_enabled:
+                        return self._result(False, record.reason)
+                    if not self._recover(failure, tuple(search_result.path[index])):
+                        return self._result(False, record.reason)
+                    recovery_needed = True
+                    break
+                if self.environment.agent_position == self.environment.goal_position:
+                    self.failure_detector.observe_goal_reached(self.environment)
+                    self._verify_task_completed()
+                    self._log("GOAL reached and position verified.")
+                    self._emit("GOAL_REACHED")
+                    return self._result(True, "goal_reached")
+            if not recovery_needed:
+                return self._result(False, "route_finished_without_goal")
+        return self._result(False, "step_limit_reached")
+
+    def execute_next(self, expected_position: Position | list[int]) -> ActionRecord:
+        """Select, execute, and verify the one action that should reach a route node."""
+        expected = tuple(expected_position)
+        current = self.environment.agent_position
+        delta = (expected[0] - current[0], expected[1] - current[1])
+        direction = self._DIRECTION_FOR_DELTA.get(delta)
+        step = len(self.actions) + 1
+        if direction is None:
+            record = ActionRecord(step, None, expected, current, False, "invalid_route_step")
+            self.actions.append(record)
+            self._log(f"STEP {step}: invalid route transition {current} -> {expected}.")
+            return record
+
+        self._log(f"STEP {step}: at {current}; choosing {direction} toward {expected}.")
+        self._emit("MOVING", direction=direction, expected_position=expected)
+        movement: MoveResult = self.environment.move(direction)
+        actual = self.environment.agent_position
+        if not movement.moved:
+            reason = f"movement_blocked:{movement.reason}"
+            succeeded = False
+        elif actual != expected:
+            reason = "unexpected_position"
+            succeeded = False
+        else:
+            reason = "moved"
+            succeeded = True
+        record = ActionRecord(step, direction, expected, actual, succeeded, reason)
+        self.actions.append(record)
+        detected = self.failure_detector.observe_movement(self.environment, movement, expected)
+        if detected:
+            self._log(f"CLASSIFIED {detected.failure_type.value}: {detected.evidence}")
+        self._log(f"STEP {step}: {'verified' if succeeded else 'failure'}; actual position {actual} ({reason}).")
+        if succeeded and self.recovery_mode == "m11" and self._pending_recoveries:
+            self._verify_progress_restored(actual)
+        return record
+
+    def _result(self, reached_goal: bool, reason: str) -> AgentRunResult:
+        if self.recovery_mode == "m11" and not reached_goal:
+            for attempt_id in self._pending_recoveries:
+                self.recovery_engine.verify(attempt_id, VerificationState.RECOVERY_FAILED, f"Task ended before restored progress: {reason}.")
+        self.adaptive_memory.ingest(self.recovery_engine.history)
+        if not reached_goal:
+            self._emit("SAFE_STOP", reason=reason)
+        return AgentRunResult(reached_goal, reason, self.route, list(self.actions), list(self.invalidated_positions), list(self.failure_detector.history), list(self.recovery_engine.history))
+
+    def _recover(self, failure: FailureRecord, expected: Position | None) -> bool:
+        if self.recovery_mode == "m11":
+            return self._recover_m11(failure, expected)
+        return self._recover_m9(failure, expected)
+
+    def _recover_m9(self, failure: FailureRecord, expected: Position | None) -> bool:
+        diagnosis = self.diagnosis_engine.diagnose(failure, self.environment, self.actions, self.failure_detector.history)
+        self._emit("DIAGNOSING", failure=failure, diagnosis=diagnosis)
+        alternative = self._safe_alternative_exists()
+        decision = self.recovery_engine.decide(diagnosis, self.environment, alternative)
+        self._emit("RECOVERING", diagnosis=diagnosis, recovery_action=decision.action.value, decision_reason=decision.reason)
+        self._log(f"RECOVERY {decision.action.value}: {decision.reason}")
+        if decision.action == RecoveryAction.REQUEST_HUMAN_HELP:
+            self.recovery_engine.record(diagnosis, decision, "human_help_requested", False)
+            return False
+        if decision.action == RecoveryAction.WAIT:
+            self.environment.advance()
+            obstacle = self.environment.obstacle_info(expected) if expected else {"present": True}
+            success = not obstacle.get("present", False)
+            self.recovery_engine.record(diagnosis, decision, "obstacle_cleared" if success else "condition_persists", success, ticks_spent=1)
+            return success
+        if decision.action == RecoveryAction.RETRY and expected is not None:
+            result = self.execute_next(expected)
+            retry_count = 1
+            while (
+                not result.succeeded
+                and retry_count < 2
+                and "transient_failure" in result.reason
+                and self._safe_alternative_exists()
+            ):
+                retry_count += 1
+                result = self.execute_next(expected)
+            self.recovery_engine.record(diagnosis, decision, f"{result.reason}; verified_retries={retry_count}", result.succeeded)
+            return result.succeeded
+        if decision.action == RecoveryAction.GATHER_INFORMATION:
+            snapshot = self.environment.get_state()
+            self.recovery_engine.record(diagnosis, decision, f"snapshot_v{snapshot['state_version']}", True)
+            return True
+        if decision.action == RecoveryAction.REPLAN:
+            self.recovery_engine.record(diagnosis, decision, "alternative_route_available" if alternative else "no_alternative_route", alternative)
+            return alternative
+        self.recovery_engine.record(diagnosis, decision, "recovery_not_executable", False)
+        return False
+
+    def _collect_visual_context(
+        self,
+        failure: FailureRecord,
+        diagnosis: FailureDiagnosis,
+        alternative: bool,
+    ) -> dict[str, Any]:
+        """Acquire a fresh frame, run local candidate detection, and preserve image provenance.
+
+        A provider may return an image path or an OpenCV/numpy image array.
+        YOLO observations remain candidates; they are never converted into map
+        coordinates or confirmed obstacles.
+        """
+        context: dict[str, Any] = {
+            "perception_source": "YOLO_AND_MUSE_SPARK",
+            "visual_observations": [],
+            "visual_detection_count": 0,
+            "image_attached_by_reasoning_adapter": False,
+            "perception_status": "NO_IMAGE_CONFIGURED",
+            "visual_note": "No fresh image was acquired.",
+        }
+
+        image_value = None
+        if self.image_provider is not None:
+            try:
+                image_value = self.image_provider()
+            except Exception as error:
+                context.update({
+                    "perception_status": "IMAGE_ACQUISITION_FAILED",
+                    "visual_note": f"Image provider failed: {error}",
+                })
+                return context
+        else:
+            configured_path = os.getenv("REROUTE_IMAGE_PATH")
+            if configured_path and os.path.isfile(os.path.expanduser(configured_path)):
+                image_value = os.path.expanduser(configured_path)
+
+        if image_value is None:
+            return context
+
+        try:
+            if isinstance(image_value, (str, os.PathLike)):
+                image_path = os.fspath(image_value)
+                if not os.path.isfile(os.path.expanduser(image_path)):
+                    raise FileNotFoundError("Image provider returned a missing image path.")
+                if self.vision_engine is not None:
+                    image = self.vision_engine.load_image(image_path)
+                else:
+                    image = None
+                context["image_path"] = os.path.expanduser(image_path)
+            else:
+                image = image_value
+                image_path = None
+
+            if image is not None and self.vision_engine is not None:
+                visual_state = self.vision_engine.prepare_reasoning_context(
+                    {
+                        "failure_type": failure.failure_type.value,
+                        "diagnosis": diagnosis.cause.value,
+                        "confidence": diagnosis.confidence,
+                        "safe_alternative_route": alternative,
+                        "environment_state": self.environment.get_state(),
+                    },
+                    image,
+                )
+                context.update(visual_state)
+
+            # Encode in-memory frames for the existing multimodal adapter.
+            if image is not None and image_path is None:
+                import cv2
+                import numpy as np
+                if not isinstance(image, np.ndarray):
+                    raise TypeError("image_provider must return an image path or numpy image array.")
+                ok, encoded = cv2.imencode(".jpg", image)
+                if not ok:
+                    raise ValueError("Could not encode acquired image for Muse Spark.")
+                context["image_data_url"] = (
+                    "data:image/jpeg;base64,"
+                    + base64.b64encode(encoded.tobytes()).decode("ascii")
+                )
+
+            if image_path is not None:
+                context["perception_status"] = "IMAGE_READY_FOR_MUSE_SPARK"
+                context["perception_source"] = "YOLO_AND_MUSE_SPARK" if self.vision_engine else "META_MUSE_SPARK_DIRECT_IMAGE_INPUT"
+            elif image is not None:
+                context["perception_status"] = "IMAGE_READY_FOR_MUSE_SPARK"
+                context["perception_source"] = "YOLO_AND_MUSE_SPARK" if self.vision_engine else "META_MUSE_SPARK_DIRECT_IMAGE_INPUT"
+
+            context["image_attached_by_reasoning_adapter"] = True
+            context["visual_note"] = (
+                "Fresh image acquired. YOLO outputs are unverified visual candidates; "
+                "image-relative positions are not physical distances or grid coordinates."
+            )
+            return context
+        except Exception as error:
+            # A failed perception step must not be presented as valid visual evidence.
+            context.update({
+                "perception_status": "IMAGE_PROCESSING_FAILED",
+                "perception_source": "VISUAL_ACQUISITION",
+                "visual_observations": [],
+                "visual_detection_count": 0,
+                "image_attached_by_reasoning_adapter": False,
+                "image_path": None,
+                "image_data_url": None,
+                "visual_note": f"Image processing failed: {error}",
+            })
+            return context
+
+    def _record_visual_observation(self, context: dict[str, Any], phase: str) -> dict[str, Any]:
+        """Append an auditable observation-cycle entry without promoting pixels to map facts."""
+        state = self.environment.get_state()
+        entry = {
+            "sequence": len(self.visual_observation_history) + 1,
+            "phase": phase,
+            "tick": state["tick"],
+            "state_version": state["state_version"],
+            "captured_at_monotonic_ns": time.monotonic_ns(),
+            "perception_status": context.get("perception_status", "UNKNOWN"),
+            "perception_source": context.get("perception_source", "UNKNOWN"),
+            "visual_detection_count": int(context.get("visual_detection_count", 0) or 0),
+            "image_available": context.get("perception_status") == "IMAGE_READY_FOR_MUSE_SPARK",
+            "visual_observations": list(context.get("visual_observations", [])),
+            "visual_note": context.get("visual_note", ""),
+        }
+        self.visual_observation_history.append(entry)
+        self._emit(
+            "OBSERVING",
+            observation_phase=phase,
+            observation=entry,
+        )
+        return entry
+
+    def _recover_m11(self, failure: FailureRecord, expected: Position | None) -> bool:
+        """Candidate recovery with visual context and bounded verification."""
+
+        diagnosis = self.diagnosis_engine.diagnose(
+            failure,
+            self.environment,
+            self.actions,
+            self.failure_detector.history
+        )
+
+        self._emit("DIAGNOSING", failure=failure, diagnosis=diagnosis)
+
+        alternative = self._safe_alternative_exists()
+
+        # Collect visual observations independently of the external policy.
+        visual_context = self._collect_visual_context(
+            failure=failure,
+            diagnosis=diagnosis,
+            alternative=alternative
+        )
+
+        self.last_visual_context = visual_context
+        self._record_visual_observation(visual_context, "PRE_DECISION")
+
+        self._log(
+            f"VISUAL PERCEPTION: "
+            f"{visual_context.get('perception_status', 'UNKNOWN')} | "
+            f"detections={visual_context.get('visual_detection_count', 0)}"
+        )
+        decision_data = None
+        decision_source = "LOCAL_RECOVERY"
+        decision_error = None
+
+        # Only verified prior outcomes enter adaptive memory. Ingest before
+        # each new decision so completed recoveries can inform later choices.
+        self.adaptive_memory.ingest(self.recovery_engine.history)
+        adaptive_snapshot = self.adaptive_memory.snapshot(diagnosis.cause.value)
+
+        # Use external decision policy if configured.
+        if self.decision_policy is not None:
+            try:
+                decision_data = self.decision_policy({
+                    "failure_type": failure.failure_type.value,
+                    "diagnosis": diagnosis.cause.value,
+                    "confidence": diagnosis.confidence,
+                    "environment_state": self.environment.get_state(),
+                    "safe_alternative_route": alternative,
+                    "obstacles_known": True,
+                    "path_blocked": failure.failure_type.value == "MOVEMENT_BLOCKED",
+                    "recovery_history": [
+                        record.decision.action.value
+                        for record in self.recovery_engine.history
+                    ],
+                    "visual_context": visual_context,
+                    "visual_observations": visual_context.get(
+                        "visual_observations", []
+                    ),
+                    "visual_detection_count": visual_context.get(
+                        "visual_detection_count", 0
+                    ),
+                    "perception_status": visual_context.get(
+                        "perception_status", "UNKNOWN"
+                    ),
+                    "image_path": visual_context.get("image_path"),
+                    "image_data_url": visual_context.get("image_data_url"),
+                    "perception_source": visual_context.get("perception_source"),
+                    "visual_note": visual_context.get("visual_note"),
+                    "visual_navigation_warning": visual_context.get("visual_navigation_warning", False),
+                    "perception_limitation": visual_context.get("perception_limitation"),
+                    "adaptive_learning": adaptive_snapshot,
+                })
+
+                if not isinstance(decision_data, dict):
+                    raise TypeError("Decision policy must return a dictionary.")
+
+                if "selected_action" not in decision_data:
+                    raise KeyError(
+                        "Decision policy result is missing 'selected_action'."
+                    )
+
+                action = RecoveryAction(decision_data["selected_action"])
+
+                decision = RecoveryDecision(
+                    action=action,
+                    reason="Decision pipeline recommendation"
+                )
+                decision_source = "EXTERNAL_DECISION_PIPELINE"
+
+            except Exception as error:
+                decision_error = str(error)
+                self._log(
+                    f"External decision failed: {decision_error}. Using local recovery."
+                )
+
+                # Do not display an incomplete or invalid result as a model decision.
+                decision_data = None
+                decision_source = "LOCAL_RECOVERY"
+
+                decision = self.recovery_engine.decide(
+                    diagnosis,
+                    self.environment,
+                    alternative
+                )
+
+        else:
+            decision = self.recovery_engine.decide(
+                diagnosis,
+                self.environment,
+                alternative
+            )
+
+        start_tick = self.environment.tick
+        start_version = self.environment.state_version
+        nodes = (expected,) if expected else ()
+
+        self._log(
+            f"RECOVERY {decision.action.value}: {decision.reason}"
+        )
+
+        # Forward the complete pipeline result with the actual selected action.
+        # The observer receives this data but does not control agent execution.
+        self._emit(
+            "RECOVERING",
+            diagnosis=diagnosis,
+            recovery_action=decision.action.value,
+            decision_reason=decision.reason,
+            decision_source=decision_source,
+            decision_details=decision_data,
+            decision_error=decision_error
+        )
+
+        if decision.action == RecoveryAction.REQUEST_HUMAN_HELP:
+            self.recovery_engine.record(
+                diagnosis, decision, "human_help_requested", False,
+                start_tick=start_tick,
+                end_tick=self.environment.tick,
+                affected_route_nodes=nodes,
+                observation_versions=(
+                    start_version,
+                     self.environment.state_version
+                )
+            )
+            return False
+
+        if decision.action == RecoveryAction.WAIT:
+            info = (
+                self.environment.obstacle_info(expected)
+                if expected else {}
+            )
+
+            duration = info.get("remaining_duration")
+
+            budget = min(
+                self.max_wait_ticks,
+                duration if isinstance(duration, int)
+                else self.max_wait_ticks
+            )
+
+            budget = max(1, budget)
+            versions = [start_version]
+
+            for waited in range(1, budget + 1):
+                self.environment.advance()
+                versions.append(self.environment.state_version)
+
+                info = (
+                    self.environment.obstacle_info(expected)
+                    if expected else {"present": True}
+                )
+
+                if not info.get("present", False):
+                    record = self.recovery_engine.record(
+                        diagnosis, decision, "obstacle_cleared", True,
+                        waited, start_tick, self.environment.tick,
+                        nodes, tuple(versions)
+                    )
+
+                    self.recovery_engine.verify(
+                        record.attempt_id,
+                        VerificationState.ENVIRONMENT_CHANGED,
+                        "Expected route node became clear during bounded wait."
+                    )
+
+                    self._pending_recoveries.append(record.attempt_id)
+                    return True
+
+                if self._safe_alternative_exists():
+                    record = self.recovery_engine.record(
+                        diagnosis, decision, "alternative_route_observed",
+                        True, waited, start_tick, self.environment.tick,
+                        nodes, tuple(versions)
+                    )
+
+                    self._pending_recoveries.append(record.attempt_id)
+                    return True
+
+            self.recovery_engine.record(
+                diagnosis, decision, "wait_budget_exhausted", False,
+                budget, start_tick, self.environment.tick,
+                nodes, tuple(versions)
+            )
+            return False
+
+        if decision.action == RecoveryAction.RETRY and expected is not None:
+            versions = [start_version]
+            result = None
+
+            for retry_count in range(1, 3):
+                if len(self.actions) >= self._movement_limit:
+                    break
+
+                self.environment.advance()
+                versions.append(self.environment.state_version)
+
+                if expected in self._blocked_route_positions([list(expected)]):
+                    break
+
+                result = self.execute_next(expected)
+
+                if result.succeeded:
+                    record = self.recovery_engine.record(
+                        diagnosis, decision,
+                        f"retry_succeeded; verified_retries={retry_count}",
+                        True, retry_count, start_tick,
+                        self.environment.tick, nodes, tuple(versions)
+                    )
+
+                    self._pending_recoveries.append(record.attempt_id)
+                    return True
+
+                if "transient_failure" not in result.reason:
+                    break
+
+            self.recovery_engine.record(
+                diagnosis, decision,
+                "retry_budget_exhausted_or_route_changed",
+               False, 0, start_tick, self.environment.tick,
+               nodes, tuple(versions)
+            )
+            return False
+
+        if decision.action == RecoveryAction.GATHER_INFORMATION:
+            # The action is not complete until a post-action observation has
+            # been requested. The provider is called again so camera-backed
+            # implementations can return a genuinely new frame.
+            snapshot = self.environment.get_state()
+            refreshed_context = self._collect_visual_context(
+                failure=failure,
+                diagnosis=diagnosis,
+                alternative=self._safe_alternative_exists(),
+            )
+            self.last_visual_context = refreshed_context
+            observation = self._record_visual_observation(
+                refreshed_context,
+                "POST_ACTION_REOBSERVATION",
+            )
+            refreshed = observation["image_available"]
+            result_text = (
+                f"snapshot_v{snapshot['state_version']}; "
+                f"post_action_observation={observation['perception_status']}"
+            )
+
+            record = self.recovery_engine.record(
+                diagnosis, decision,
+                result_text,
+                True, 0, start_tick, self.environment.tick,
+                nodes,
+                (start_version, snapshot["state_version"])
+            )
+            if refreshed:
+                self.recovery_engine.verify(
+                    record.attempt_id,
+                    VerificationState.OBSERVATION_REFRESHED,
+                    (
+                        "A post-action image was acquired and passed through "
+                        "the configured local visual-perception path."
+                    ),
+                )
+
+            self._pending_recoveries.append(record.attempt_id)
+            return True
+
+        if decision.action == RecoveryAction.REPLAN:
+            record = self.recovery_engine.record(
+                diagnosis, decision,
+                "alternative_route_available"
+                if alternative else "no_alternative_route",
+                alternative, 0, start_tick, self.environment.tick,
+                nodes,
+                (start_version, self.environment.state_version)
+            )
+
+            if alternative:
+                self._pending_recoveries.append(record.attempt_id)
+
+            return alternative
+
+        self.recovery_engine.record(
+            diagnosis, decision, "recovery_not_executable", False,
+            start_tick=start_tick,
+            end_tick=self.environment.tick,
+            affected_route_nodes=nodes,
+            observation_versions=(
+                start_version,
+                self.environment.state_version
+            )
+        )
+
+        return False
+
+    def _verify_progress_restored(self, position: Position) -> None:
+        for attempt_id in self._pending_recoveries:
+            self.recovery_engine.verify(attempt_id, VerificationState.PROGRESS_RESTORED, f"Navigation resumed with verified movement to {position}.")
+        self._pending_recoveries = []
+        self._emit("VERIFYING", verification_state=VerificationState.PROGRESS_RESTORED.value, position=position)
+
+    def _verify_task_completed(self) -> None:
+        for record in self.recovery_engine.history:
+            if VerificationState.PROGRESS_RESTORED in record.verification_states:
+                self.recovery_engine.verify(record.attempt_id, VerificationState.TASK_COMPLETED, "Agent position equals the goal position.")
+        self._emit("VERIFYING", verification_state=VerificationState.TASK_COMPLETED.value)
+
+    def _safe_alternative_exists(self) -> bool:
+        state = self.environment.get_state()
+        result = (astar_search if self.algorithm == "astar" else bfs_search)(state["agent_position"], state["goal_position"], state["obstacles"], state["width"], state["height"])
+        self.alternative_route = result.path
+        return bool(result.path)
+
+    def _blocked_route_positions(self, route: list[list[int]]) -> list[Position]:
+        state = self.environment.get_state()
+        obstacles = set(state["obstacles"])
+        return [tuple(position) for position in route if tuple(position) in obstacles]
+
+    def _log(self, message: str) -> None:
+        self.logger(f"[Agent] {message}")
+
+    def _emit(self, activity: str, **payload: Any) -> None:
+        """Notify an optional observer without giving it control of agent decisions."""
+        if self.event_callback is None:
+            return
+        state = self.environment.get_state()
+        event_payload = {
+            "state": state,
+            "route": tuple(tuple(position) for position in self.route or ()),
+            "alternative_route": tuple(tuple(position) for position in self.alternative_route or ()),
+            "actions": len(self.actions),
+            "failures": len(self.failure_detector.history),
+            "recoveries": len(self.recovery_engine.history),
+            **payload,
+        }
+        event = AgentEvent(activity, state["tick"], state["state_version"], event_payload)
+        if self.event_callback(event) is False:
+            raise AgentExecutionCancelled("Simulation observer cancelled execution.")
+
+
+
+==================================================
+FILE: environment.py
+==================================================
+"""Grid-world simulation used by the REROUTE agent."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+Position = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class MoveResult:
+    """The verified outcome of a requested movement."""
+
+    moved: bool
+    reason: str
+    previous_position: Position
+    current_position: Position
+
+
+@dataclass(frozen=True)
+class ScheduledObstacleEvent:
+    """A deterministic obstacle change applied when the environment reaches a tick."""
+
+    tick: int
+    action: str
+    position: Position
+    destination: Position | None = None
+    duration: int | None = None
+
+
+class Environment:
+    """A rectangular grid with static and runtime-added obstacles."""
+
+    DIRECTIONS: dict[str, Position] = {
+        "up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0),
+    }
+    DEFAULT_OBSTACLES: tuple[Position, ...] = (
+        (2, 0), (2, 1), (2, 2), (4, 4), (4, 5), (4, 6),
+        (6, 7), (7, 7), (8, 7),
+    )
+
+    def __init__(
+        self,
+        width: int = 10,
+        height: int = 10,
+        agent_position: Iterable[int] = (0, 0),
+        goal_position: Iterable[int] = (9, 9),
+        obstacles: Iterable[Iterable[int]] | None = None,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("Grid width and height must be positive.")
+        self.width = width
+        self.height = height
+        self.agent_position = self._as_position(agent_position)
+        self.goal_position = self._as_position(goal_position)
+        self._validate_position(self.agent_position)
+        self._validate_position(self.goal_position)
+
+        initial_obstacles = self.DEFAULT_OBSTACLES if obstacles is None else obstacles
+        self._static_obstacles = {self._as_position(position) for position in initial_obstacles}
+        for obstacle in self._static_obstacles:
+            self._validate_position(obstacle)
+        if self.agent_position in self._static_obstacles or self.goal_position in self._static_obstacles:
+            raise ValueError("The agent and goal cannot occupy an obstacle.")
+
+        self._dynamic_obstacles: dict[Position, int | None] = {}
+        self._scheduled_events: list[ScheduledObstacleEvent] = []
+        self._transient_move_failures = 0
+        self.tick = 0
+        self.state_version = 0
+        self.events: list[str] = []
+
+    @property
+    def obstacles(self) -> list[list[int]]:
+        """Current obstacles in the list format expected by the existing BFS code."""
+        return [list(position) for position in sorted(self._all_obstacles())]
+
+    def move(self, direction: str) -> MoveResult:
+        """Attempt one movement and return a verified outcome without printing."""
+        previous_position = self.agent_position
+        if self._transient_move_failures:
+            self._transient_move_failures -= 1
+            self.events.append(f"move_failed:transient_failure:{previous_position}")
+            return MoveResult(False, "transient_failure", previous_position, previous_position)
+        if direction not in self.DIRECTIONS:
+            return self._record_move(False, "invalid_direction", previous_position)
+        dx, dy = self.DIRECTIONS[direction]
+        target = (previous_position[0] + dx, previous_position[1] + dy)
+        if not self.in_bounds(target):
+            return self._record_move(False, "outside_grid", previous_position)
+        if target in self._all_obstacles():
+            return self._record_move(False, "obstacle", previous_position)
+
+        self.agent_position = target
+        self.state_version += 1
+        self.events.append(f"move:{direction}:{previous_position}->{target}")
+        return MoveResult(True, "moved", previous_position, target)
+
+    def set_transient_move_failures(self, count: int) -> None:
+        """Configure a deterministic number of injected move failures for experiments."""
+        if count < 0:
+            raise ValueError("Failure count cannot be negative.")
+        self._transient_move_failures = count
+        self.events.append(f"transient_move_failures_configured:{count}")
+
+    def add_dynamic_obstacle(self, position: Iterable[int], duration: int | None = None) -> None:
+        """Add a runtime obstacle, optionally expiring after ``duration`` updates."""
+        obstacle = self._as_position(position)
+        self._validate_position(obstacle)
+        if obstacle == self.agent_position or obstacle == self.goal_position:
+            raise ValueError("Cannot place a dynamic obstacle on the agent or goal.")
+        if duration is not None and duration <= 0:
+            raise ValueError("Obstacle duration must be positive or None.")
+        self._dynamic_obstacles[obstacle] = duration
+        self.state_version += 1
+        self.events.append(f"dynamic_obstacle_added:{obstacle}:duration={duration}")
+
+    def remove_dynamic_obstacle(self, position: Iterable[int]) -> bool:
+        """Remove a runtime obstacle and report whether one was present."""
+        obstacle = self._as_position(position)
+        if obstacle not in self._dynamic_obstacles:
+            return False
+        del self._dynamic_obstacles[obstacle]
+        self.state_version += 1
+        self.events.append(f"dynamic_obstacle_removed:{obstacle}")
+        return True
+
+    def move_dynamic_obstacle(self, position: Iterable[int], destination: Iterable[int]) -> bool:
+        """Move one existing dynamic obstacle to an unoccupied valid position."""
+        source, target = self._as_position(position), self._as_position(destination)
+        if source not in self._dynamic_obstacles:
+            return False
+        self._validate_position(target)
+        if target in self._all_obstacles() or target in {self.agent_position, self.goal_position}:
+            raise ValueError("Dynamic obstacle destination is occupied or reserved.")
+        duration = self._dynamic_obstacles.pop(source)
+        self._dynamic_obstacles[target] = duration
+        self.state_version += 1
+        self.events.append(f"dynamic_obstacle_moved:{source}->{target}")
+        return True
+
+    def schedule_obstacle_event(
+        self, tick: int, action: str, position: Iterable[int],
+        destination: Iterable[int] | None = None, duration: int | None = None,
+    ) -> None:
+        """Schedule an add, remove, or move event for reproducible simulations."""
+        if tick <= self.tick:
+            raise ValueError("Scheduled tick must be in the future.")
+        if action not in {"add", "remove", "move"}:
+            raise ValueError("Scheduled action must be 'add', 'remove', or 'move'.")
+        source = self._as_position(position)
+        target = self._as_position(destination) if destination is not None else None
+        if action == "move" and target is None:
+            raise ValueError("A move event requires a destination.")
+        event = ScheduledObstacleEvent(tick, action, source, target, duration)
+        self._scheduled_events.append(event)
+        self._scheduled_events.sort(key=lambda item: item.tick)
+        self.events.append(f"obstacle_event_scheduled:{event}")
+
+    def advance(self) -> None:
+        """Advance one environment update and expire temporary obstacles."""
+        self.tick += 1
+        expired: list[Position] = []
+        for position, remaining in self._dynamic_obstacles.items():
+            if remaining is not None:
+                self._dynamic_obstacles[position] = remaining - 1
+                if remaining == 1:
+                    expired.append(position)
+        for position in expired:
+            del self._dynamic_obstacles[position]
+            self.events.append(f"dynamic_obstacle_expired:{position}")
+        due_events = [event for event in self._scheduled_events if event.tick == self.tick]
+        self._scheduled_events = [event for event in self._scheduled_events if event.tick != self.tick]
+        for event in due_events:
+            if event.action == "add":
+                self.add_dynamic_obstacle(event.position, event.duration)
+            elif event.action == "remove":
+                self.remove_dynamic_obstacle(event.position)
+            else:
+                self.move_dynamic_obstacle(event.position, event.destination)
+            self.events.append(f"obstacle_event_applied:{event}")
+        self.state_version += 1
+
+    def get_state(self) -> dict[str, object]:
+        """Return a copy-safe state snapshot for controllers and diagnostics."""
+        return {
+            "width": self.width, "height": self.height,
+            "agent_position": self.agent_position, "goal_position": self.goal_position,
+            "obstacles": tuple(sorted(self._all_obstacles())), "tick": self.tick,
+            "state_version": self.state_version,
+        }
+
+    def obstacle_info(self, position: Iterable[int]) -> dict[str, object]:
+        """Return non-secret obstacle metadata used for failure classification."""
+        obstacle = self._as_position(position)
+        if obstacle in self._dynamic_obstacles:
+            remaining = self._dynamic_obstacles[obstacle]
+            return {"present": True, "kind": "dynamic", "temporary": remaining is not None, "remaining_duration": remaining}
+        return {"present": obstacle in self._static_obstacles, "kind": "static" if obstacle in self._static_obstacles else None, "temporary": False, "remaining_duration": None}
+
+    def display(self, path: Iterable[Iterable[int]] | None = None) -> None:
+        """Print the current grid, optionally overlaying a proposed route."""
+        path_positions = {self._as_position(position) for position in path or ()}
+        print("\nEnvironment Map:")
+        print("A = Agent | G = Goal | # = Obstacle | * = Path | . = Empty")
+        obstacles = self._all_obstacles()
+        for y in range(self.height):
+            row: list[str] = []
+            for x in range(self.width):
+                position = (x, y)
+                if position == self.agent_position:
+                    row.append(" A ")
+                elif position == self.goal_position:
+                    row.append(" G ")
+                elif position in obstacles:
+                    row.append(" # ")
+                elif position in path_positions:
+                    row.append(" * ")
+                else:
+                    row.append(" . ")
+            print("".join(row))
+
+    def in_bounds(self, position: Iterable[int]) -> bool:
+        x, y = self._as_position(position)
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def _all_obstacles(self) -> set[Position]:
+        return self._static_obstacles | set(self._dynamic_obstacles)
+
+    def _record_move(self, moved: bool, reason: str, previous_position: Position) -> MoveResult:
+        self.events.append(f"move_failed:{reason}:{previous_position}")
+        return MoveResult(moved, reason, previous_position, previous_position)
+
+    def _validate_position(self, position: Position) -> None:
+        if not self.in_bounds(position):
+            raise ValueError(f"Position {position} is outside the grid.")
+
+    @staticmethod
+    def _as_position(position: Iterable[int]) -> Position:
+        values = tuple(position)
+        if len(values) != 2 or not all(isinstance(value, int) for value in values):
+            raise ValueError("Positions must contain exactly two integers.")
+        return values[0], values[1]
+
+
+
+==================================================
+FILE: main.py
+==================================================
+"""Run REROUTE scenarios. Offline by default; --live makes at most ONE Meta call."""
+from __future__ import annotations
+import argparse
+import os
+from pathlib import Path
+from scenarios import run_dynamic_scenarios
+from simulation_controller import reroute_decision_policy
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run REROUTE autonomous scenarios.")
+    parser.add_argument("--live", action="store_true", help="Use Muse Spark for at most one recovery decision (one API request).")
+    parser.add_argument("--image", type=Path, help="Optional local image attached to that one live request.")
+    args = parser.parse_args()
+
+    print("=" * 48)
+    print("          REROUTE AUTONOMOUS AGENT")
+    print("=" * 48)
+    if args.image:
+        image_path = args.image.expanduser().resolve()
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        os.environ["REROUTE_IMAGE_PATH"] = str(image_path)
+        print(f"Image configured for Muse Spark: {image_path.name}")
+
+    if args.live:
+        print("REASONING MODE: LIVE MUSE SPARK, hard limit = ONE API request for this run.")
+    else:
+        print("REASONING MODE: OFFLINE MOCK. No Meta API requests will be made.")
+
+    live_call_used = False
+    def policy(context):
+        nonlocal live_call_used
+        use_live = args.live and not live_call_used
+        if use_live:
+            live_call_used = True
+        return reroute_decision_policy(context, live_reasoning=use_live)
+
+    results = run_dynamic_scenarios(logger=print, decision_policy=policy)
+    print("\n========== FINAL RESULTS ==========")
+    for result in results:
+        print(f"\nScenario: {result.name}")
+        print(f"Initial route: {result.initial_route}")
+        print(f"Result: {result.outcome.reason}")
+        print(f"Goal reached: {result.outcome.reached_goal}")
+        print(f"Invalidated positions: {result.outcome.invalidated_positions}")
+        if "Temporary" in result.name:
+            print(f"Temporary obstacle cleared: {result.temporary_obstacle_cleared}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+==================================================
+FILE: decision_pipeline.py
+==================================================
+"""Evidence -> recommendation -> validation -> prediction -> safe selection."""
+from __future__ import annotations
+from functools import lru_cache
+from typing import Any, Callable
+
+from meta_reasoning_adapter import get_recovery_recommendation
+from recommendation_validator import validate_recommendation
+from outcome_predictor import predict_outcome, build_action_statistics
+from decision_selector import select_best_action
+from evaluation import EvaluationRunner
+from visual_evidence import assess_visual_evidence
+from predictive_reasoner import rank_candidate_actions
+
+
+@lru_cache(maxsize=1)
+def _historical_action_statistics():
+    """Run deterministic offline evaluation once per process."""
+    return build_action_statistics(EvaluationRunner().run())
+
+
+def _build_evidence_context(context: dict[str, Any], recommendation: dict[str, Any]) -> dict[str, Any]:
+    """Merge adapter-verified visual provenance without inventing map facts."""
+    evidence_context = dict(context)
+    attached = recommendation.get("_reroute_visual_input_attached") is True
+    analyzed = recommendation.get("_reroute_visual_analysis_completed") is True and attached
+    summary = recommendation.get("visual_summary")
+
+    if analyzed:
+        observations = evidence_context.get("visual_observations", [])
+        if not isinstance(observations, list):
+            observations = []
+        observations = list(observations)
+        if isinstance(summary, str) and summary.strip() and summary not in observations:
+            observations.append(summary)
+        evidence_context["visual_observations"] = observations
+        evidence_context["perception_status"] = "IMAGE_ANALYZED"
+
+    return evidence_context
+
+
+def run_decision_pipeline(
+    context: dict[str, Any],
+    recommendation_provider: Callable | None = None,
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise TypeError("context must be a dictionary.")
+
+    statistics = {
+        action: dict(counts)
+        for action, counts in _historical_action_statistics().items()
+    }
+    # Verified runtime outcomes supplement the deterministic baseline. They
+    # never bypass feasibility checks or the selector's risk gates.
+    adaptive = context.get("adaptive_learning", {})
+    adaptive_stats = adaptive.get("action_statistics", {}) if isinstance(adaptive, dict) else {}
+    if isinstance(adaptive_stats, dict):
+        for action, counts in adaptive_stats.items():
+            if not isinstance(counts, dict):
+                continue
+            current = statistics.setdefault(action, {"success": 0, "failure": 0})
+            for outcome in ("success", "failure"):
+                value = counts.get(outcome, 0)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    current[outcome] = current.get(outcome, 0) + value
+
+    provider = recommendation_provider or get_recovery_recommendation
+    recommendation = provider(context)
+    valid, message = validate_recommendation(recommendation, context)
+
+    if not valid:
+        return {"status": "REJECTED", "reason": message, "original_recommendation": recommendation}
+
+    evidence_context = _build_evidence_context(context, recommendation)
+    visual_evidence = assess_visual_evidence(evidence_context, recommendation)
+    environment_state = {
+        **context,
+        **context.get("environment_state", {}),
+        "visual_evidence": visual_evidence,
+        "adaptive_learning": {
+            "source": adaptive.get("source", "NO_RUNTIME_HISTORY") if isinstance(adaptive, dict) else "NO_RUNTIME_HISTORY",
+            "diagnosis": adaptive.get("diagnosis", "ALL") if isinstance(adaptive, dict) else "ALL",
+            "verified_observations": adaptive.get("observations", 0) if isinstance(adaptive, dict) else 0,
+            "total_verified_outcomes": adaptive.get("total_verified_outcomes", 0) if isinstance(adaptive, dict) else 0,
+        },
+    }
+
+    evaluated = []
+    for action in ("REPLAN", "WAIT", "RETRY", "GATHER_INFORMATION", "REQUEST_HUMAN_HELP"):
+        prediction = predict_outcome(action, environment_state, statistics)
+        evaluated.append({"action": action, "prediction": prediction})
+
+    # M12 compares counterfactual action outcomes. The selector still applies
+    # its existing feasibility and risk gates before any candidate can win.
+    evaluated = rank_candidate_actions(evaluated, environment_state)
+    selected = select_best_action(
+        evaluated,
+        recommended_action=recommendation["recommended_action"],
+    )
+
+    if selected is None:
+        return {
+            "status": "NO_SAFE_ACTION",
+            "reason": (
+                "No candidate action has sufficient historical support "
+                "and passes current safety constraints."
+            ),
+            "original_recommendation": recommendation,
+            "evaluated_actions": evaluated,
+            "visual_evidence": visual_evidence,
+        }
+
+    return {
+        "status": "EVALUATED",
+        "original_recommendation": recommendation,
+        "selected_action": selected["action"],
+        "prediction": selected["prediction"],
+        "evaluated_actions": evaluated,
+        "visual_summary": recommendation.get("visual_summary", ""),
+        "uncertainties": recommendation.get("uncertainties", []),
+        "required_checks": recommendation.get("required_checks", []),
+        "visual_evidence": visual_evidence,
+        "adaptive_learning": {
+            "source": adaptive.get("source", "NO_RUNTIME_HISTORY") if isinstance(adaptive, dict) else "NO_RUNTIME_HISTORY",
+            "diagnosis": adaptive.get("diagnosis", "ALL") if isinstance(adaptive, dict) else "ALL",
+            "verified_observations": adaptive.get("observations", 0) if isinstance(adaptive, dict) else 0,
+            "total_verified_outcomes": adaptive.get("total_verified_outcomes", 0) if isinstance(adaptive, dict) else 0,
+        },
+    }
+
+
+
+==================================================
+FILE: decision_selector.py
+==================================================
+"""Evidence-based selector with conservative safety constraints."""
+
+ALLOWED_ACTIONS = {
+    "WAIT",
+    "RETRY",
+    "GATHER_INFORMATION",
+    "REPLAN",
+    "REQUEST_HUMAN_HELP",
+}
+
+RISK_SCORES = {
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+    "UNKNOWN": 4,
+}
+
+
+def select_best_action(evaluated_actions, recommended_action=None):
+    if not evaluated_actions:
+        return None
+
+    eligible = []
+
+    for item in evaluated_actions:
+        action = item.get("action")
+        prediction = item.get("prediction", {})
+
+        probability = prediction.get("success_probability")
+        confidence = prediction.get("lower_confidence_bound", 0.0)
+        risk = prediction.get("risk_level")
+
+        if action not in ALLOWED_ACTIONS:
+            continue
+
+        if (
+            not isinstance(probability, (int, float))
+            or isinstance(probability, bool)
+            or not 0 <= probability <= 1
+        ):
+            continue
+
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0 <= confidence <= 1
+        ):
+            continue
+
+        if risk not in RISK_SCORES:
+            continue
+
+        if prediction.get("feasible", True) is False:
+            continue
+
+        if risk in {"HIGH", "UNKNOWN"}:
+            continue
+
+        eligible.append(item)
+
+    if not eligible:
+        return None
+
+    eligible.sort(
+        key=lambda item: (
+            RISK_SCORES[item["prediction"]["risk_level"]],
+            -item["prediction"].get("lower_confidence_bound", 0.0),
+            -item["prediction"]["success_probability"],
+            item["action"] != recommended_action,
+            -item["prediction"].get("predictive_assessment", {}).get("expected_utility", 0.0),
+            item["action"],
+        )
+    )
+
+    return eligible[0]
+
+
+
+==================================================
+FILE: recommendation_validator.py
+==================================================
+"""Strict schema and environment-safety checks for model recommendations."""
+import math
+
+ALLOWED_ACTIONS = {"WAIT", "RETRY", "GATHER_INFORMATION", "REPLAN", "REQUEST_HUMAN_HELP"}
+
+
+def validate_recommendation(recommendation, environment_state):
+    if not isinstance(recommendation, dict):
+        return False, "Invalid recommendation format."
+    action = recommendation.get("recommended_action")
+    if action not in ALLOWED_ACTIONS:
+        return False, "Unsupported recovery action."
+    confidence = recommendation.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        return False, "Invalid confidence value."
+    if not isinstance(recommendation.get("reason"), str) or not recommendation["reason"].strip():
+        return False, "Recommendation reason must be non-empty text."
+    checks = recommendation.get("required_checks")
+    if not isinstance(checks, list) or not checks or not all(isinstance(item, str) and item.strip() for item in checks):
+        return False, "Required checks must be a non-empty list of strings."
+    if recommendation.get("alternative_action") not in ALLOWED_ACTIONS:
+        return False, "Unsupported alternative action."
+    if not isinstance(environment_state, dict):
+        return False, "Invalid environment state."
+    if action == "REPLAN":
+        if not environment_state.get("safe_alternative_route", False):
+            return False, "No confirmed safe alternative route."
+        if not environment_state.get("obstacles_known", False):
+            return False, "Obstacle information is incomplete."
+    if action == "RETRY" and environment_state.get("path_blocked", False):
+        return False, "Cannot retry while the path remains blocked."
+    if action == "WAIT" and environment_state.get("wait_budget_exhausted", False):
+        return False, "Wait budget is exhausted."
+    return True, "Environment-aware validation passed."
+
+
+
+==================================================
+FILE: outcome_predictor.py
+==================================================
+"""Context-aware recovery outcome estimates from deterministic trial history."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from math import sqrt
+
+ALLOWED_ACTIONS = {
+    "REPLAN",
+    "WAIT",
+    "RETRY",
+    "GATHER_INFORMATION",
+    "REQUEST_HUMAN_HELP",
+}
+
+
+def build_action_statistics(results):
+    statistics = defaultdict(lambda: {"success": 0, "failure": 0})
+
+    for trial in results:
+        for action, succeeded in getattr(trial, "recovery_outcomes", ()):
+            if action in ALLOWED_ACTIONS:
+                statistics[action]["success" if succeeded else "failure"] += 1
+
+    return {action: dict(counts) for action, counts in statistics.items()}
+
+
+def _wilson_lower_bound(successes: int, total: int, z: float = 1.96) -> float:
+    if total <= 0:
+        return 0.0
+
+    p = successes / total
+    denominator = 1 + z * z / total
+    centre = p + z * z / (2 * total)
+    margin = z * sqrt(
+        (p * (1 - p) + z * z / (4 * total)) / total
+    )
+
+    return max(0.0, (centre - margin) / denominator)
+
+
+def predict_outcome(action, environment_state, statistics):
+    """Return a conservative estimate with feasibility and evidence."""
+
+    if action not in ALLOWED_ACTIONS:
+        return {
+            "success_probability": 0.0,
+            "lower_confidence_bound": 0.0,
+            "risk_level": "HIGH",
+            "expected_result": "Unsupported action.",
+            "observations": 0,
+            "feasible": False,
+        }
+
+    state = environment_state or {}
+
+    feasible = True
+    constraint = "No immediate constraint detected."
+
+    # Existing navigation safety constraints.
+    if action == "REPLAN" and not state.get("safe_alternative_route", False):
+        feasible = False
+        constraint = "No safe alternative route is confirmed."
+
+    elif action == "RETRY" and state.get("path_blocked", False):
+        feasible = False
+        constraint = "The target path is still blocked; retry is unsafe."
+
+    elif action == "WAIT" and not state.get(
+        "temporary_obstacle",
+        state.get("obstacle_temporary", False),
+    ):
+        constraint = "No temporary-obstacle evidence; waiting benefit is uncertain."
+
+    elif action == "REQUEST_HUMAN_HELP":
+        constraint = "Safe escalation option; it does not autonomously restore progress."
+
+    # Inspect structured visual evidence.
+    visual_evidence = state.get("visual_evidence", {})
+
+    if not isinstance(visual_evidence, dict):
+        visual_evidence = {}
+
+    evidence_status = visual_evidence.get(
+        "evidence_status",
+        "NO_VERIFIED_VISUAL_INPUT",
+    )
+
+    uncertainties = visual_evidence.get("uncertainties", [])
+
+    if not isinstance(uncertainties, list):
+        uncertainties = []
+
+    analysis_completed = evidence_status == "VISUAL_EVIDENCE_ANALYZED"
+
+    visual_warning = ""
+
+    if not analysis_completed:
+        visual_warning = " Visual analysis is unavailable or incomplete."
+
+    elif uncertainties:
+        visual_warning = (
+            f" Visual analysis contains {len(uncertainties)} unresolved uncertainties."
+        )
+
+    # Action-specific uncertainty handling.
+    uncertainty_reason = ""
+
+    if uncertainties or not analysis_completed:
+
+        if action == "RETRY":
+            if not state.get("path_blocked", False):
+                feasible = False
+                uncertainty_reason = (
+                    "Retry requires sufficient environmental evidence "
+                    "to confirm that the path is clear."
+                )
+
+        elif action == "REPLAN":
+            if not state.get("safe_alternative_route", False):
+                feasible = False
+                uncertainty_reason = (
+                    "Replanning requires a confirmed safe alternative route."
+                )
+
+        elif action == "WAIT":
+            if not state.get(
+                "temporary_obstacle",
+                state.get("obstacle_temporary", False),
+            ):
+                uncertainty_reason = (
+                    "Waiting may be appropriate, but temporary-obstacle "
+                    "evidence is missing."
+                )
+
+        elif action == "GATHER_INFORMATION":
+            uncertainty_reason = (
+                "Gather information to reduce uncertainty before acting."
+            )
+
+        elif action == "REQUEST_HUMAN_HELP":
+            uncertainty_reason = (
+                "Human assistance remains available despite visual uncertainty."
+            )
+
+    # Historical statistics remain independent of visual evidence.
+    counts = statistics.get(action, {})
+
+    successes = int(counts.get("success", 0))
+    failures = int(counts.get("failure", 0))
+    total = successes + failures
+
+    if total == 0:
+        probability = 0.5
+        lower = 0.0
+        risk = "UNKNOWN"
+
+        expected = (
+            "No historical observations; probability is an uninformative "
+            "prior, not evidence."
+        )
+
+    else:
+        probability = (successes + 1) / (total + 2)
+        lower = _wilson_lower_bound(successes, total)
+
+        risk = (
+            "LOW" if lower >= 0.60
+            else "MEDIUM" if lower >= 0.30
+            else "HIGH"
+        )
+
+        expected = (
+            f"Historical estimate from {total} observations "
+            f"({successes} successes, {failures} failures)."
+        )
+
+    # Reject actions that violate safety constraints.
+    if not feasible:
+        risk = "HIGH"
+        probability = 0.0
+        lower = 0.0
+
+    return {
+        "success_probability": round(probability, 3),
+        "lower_confidence_bound": round(lower, 3),
+        "risk_level": risk,
+        "expected_result": (
+            f"{expected} {constraint} {visual_warning} {uncertainty_reason}"
+        ),
+        "observations": total,
+        "feasible": feasible,
+        "visual_evidence_status": evidence_status,
+        "visual_uncertainty_count": len(uncertainties),
+        "uncertainty_reason": uncertainty_reason,
+    }
+
+
+==================================================
+FILE: predictive_reasoner.py
+==================================================
+"""M12: transparent counterfactual scoring for candidate recovery actions.
+
+This layer ranks only actions already evaluated by the evidence-based predictor.
+It does not create new capabilities, override feasibility, or weaken risk gates.
+Scores are comparative heuristics, not calibrated real-world probabilities.
+"""
+from __future__ import annotations
+
+ACTION_COST = {
+    "REPLAN": 8.0,
+    "WAIT": 5.0,
+    "RETRY": 10.0,
+    "GATHER_INFORMATION": 6.0,
+    "REQUEST_HUMAN_HELP": 20.0,
+}
+
+
+def assess_candidate(action: str, prediction: dict, environment_state: dict) -> dict:
+    probability = float(prediction.get("success_probability", 0.0))
+    feasible = prediction.get("feasible", False) is not False
+    uncertainty_count = int(prediction.get("visual_uncertainty_count", 0) or 0)
+    evidence_status = prediction.get("visual_evidence_status", "NO_VERIFIED_VISUAL_INPUT")
+
+    # A conservative comparative utility: verified success value minus failure
+    # exposure, execution cost, and unresolved uncertainty.
+    success_value = 100.0 * probability
+    failure_exposure = 45.0 * (1.0 - probability)
+    execution_cost = ACTION_COST.get(action, 25.0)
+    uncertainty_penalty = min(uncertainty_count, 5) * 3.0
+    if evidence_status != "VISUAL_EVIDENCE_ANALYZED":
+        uncertainty_penalty += 8.0
+
+    information_gain = 0.0
+    if action == "GATHER_INFORMATION":
+        # Potential information value only; no claim that the sensor will succeed.
+        information_gain = min(max(uncertainty_count, 1), 3) * 5.0
+
+    utility = success_value - failure_exposure - execution_cost - uncertainty_penalty + information_gain
+    if not feasible:
+        utility = -1000.0
+
+    return {
+        "expected_utility": round(utility, 2),
+        "success_value": round(success_value, 2),
+        "failure_exposure": round(failure_exposure, 2),
+        "execution_cost": execution_cost,
+        "uncertainty_penalty": round(uncertainty_penalty, 2),
+        "potential_information_value": round(information_gain, 2),
+        "assumption": "Comparative heuristic; not a calibrated real-world outcome probability.",
+    }
+
+
+def rank_candidate_actions(evaluated_actions: list[dict], environment_state: dict) -> list[dict]:
+    ranked = []
+    for item in evaluated_actions:
+        enriched = dict(item)
+        prediction = dict(item.get("prediction", {}))
+        prediction["predictive_assessment"] = assess_candidate(
+            item.get("action", ""), prediction, environment_state or {}
+        )
+        enriched["prediction"] = prediction
+        ranked.append(enriched)
+    ranked.sort(
+        key=lambda item: (
+            item["prediction"]["predictive_assessment"]["expected_utility"],
+            item["action"],
+        ),
+        reverse=True,
+    )
+    for index, item in enumerate(ranked, start=1):
+        item["prediction"]["predictive_assessment"]["rank"] = index
+    return ranked
+
+
+
+==================================================
+FILE: meta_reasoning_adapter.py
+==================================================
+"""Meta Muse Spark adapter for text-only and direct multimodal reasoning."""
+from __future__ import annotations
+import base64
+import json
+import mimetypes
+import os
+from pathlib import Path
+from typing import Any
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+API_URL = "https://api.meta.ai/v1/responses"
+MODEL = "muse-spark-1.3"
+MAX_INLINE_IMAGE_BYTES = 50_000_000
+ALLOWED_ACTIONS = {"WAIT", "RETRY", "GATHER_INFORMATION", "REPLAN", "REQUEST_HUMAN_HELP"}
+
+
+def _build_image_data_url(image_path: str | os.PathLike[str]) -> str:
+    path = Path(image_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"REROUTE image not found: {path}")
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError("REROUTE image is empty.")
+    if size > MAX_INLINE_IMAGE_BYTES:
+        raise ValueError(f"Image exceeds the {MAX_INLINE_IMAGE_BYTES:,}-byte inline limit.")
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if mime_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        raise ValueError("Unsupported image format. Use JPEG, PNG, WEBP, or GIF.")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _extract_output_text(data: dict[str, Any]) -> str:
+    chunks = []
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for block in item.get("content", []):
+                if block.get("type") == "output_text" and block.get("text"):
+                    chunks.append(block["text"])
+    if not chunks:
+        raise ValueError("Muse Spark returned no output text.")
+    return "\n".join(chunks).strip()
+
+
+def _parse_recommendation(output_text: str) -> dict[str, Any]:
+    text = output_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+            text = "\n".join(lines[1:-1]).strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Muse Spark returned invalid JSON.") from exc
+    if not isinstance(result, dict):
+        raise ValueError("Muse Spark recommendation must be a JSON object.")
+    required = {"recommended_action", "reason", "confidence", "required_checks", "alternative_action"}
+    if not required.issubset(result):
+        raise ValueError(f"Muse Spark response is missing fields: {sorted(required - set(result))}")
+    if result["recommended_action"] not in ALLOWED_ACTIONS:
+        raise ValueError("Muse Spark returned an unsupported recovery action.")
+    if result["alternative_action"] not in ALLOWED_ACTIONS:
+        raise ValueError("Muse Spark returned an unsupported alternative action.")
+    confidence = result["confidence"]
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
+        raise ValueError("Muse Spark confidence must be between 0 and 1.")
+    if not isinstance(result["reason"], str) or not result["reason"].strip():
+        raise ValueError("Muse Spark reason must be non-empty text.")
+    checks = result["required_checks"]
+    if not isinstance(checks, list) or not all(isinstance(x, str) for x in checks):
+        raise ValueError("Muse Spark required_checks must be a list of strings.")
+    return result
+
+
+def get_recovery_recommendation(
+    context: dict[str, Any],
+    image_path: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Request a recovery decision and record whether visual input was truly used."""
+    if not isinstance(context, dict):
+        raise TypeError("context must be a dictionary.")
+    api_key = os.getenv("MODEL_API_KEY")
+    if not api_key:
+        raise RuntimeError("MODEL_API_KEY not found in environment or .env")
+
+    selected_image = image_path or context.get("image_path") or os.getenv("REROUTE_IMAGE_PATH")
+    prompt_context = {k: v for k, v in context.items() if k not in {"image_path", "image_data_url", "image_bytes"}}
+    attached_intent = bool(selected_image or context.get("image_data_url"))
+    prompt_context["visual_input"] = (
+        "An image is attached. Inspect it directly. Distinguish visible evidence from assumptions. "
+        "Do not convert image-relative locations into map/grid coordinates without a supplied calibration."
+        if attached_intent else "No image supplied; reason only from structured environment evidence."
+    )
+    prompt = f"""You are the perception and reasoning component of REROUTE, an uncertainty-aware autonomous agent.
+Analyze the structured environment evidence and, if attached, the image itself. Distinguish observations,
+inferences, and unknowns. Never invent object coordinates, distances, or map positions. Image-relative
+locations are not navigation-grid coordinates. If evidence is insufficient or conflicting, prefer
+GATHER_INFORMATION or REQUEST_HUMAN_HELP over unsafe action.
+
+Recommend exactly one action: WAIT, RETRY, GATHER_INFORMATION, REPLAN, REQUEST_HUMAN_HELP.
+
+CONTEXT:
+{json.dumps(prompt_context, indent=2, default=str)}
+
+Return ONLY valid JSON with this structure:
+{{"recommended_action":"REPLAN","reason":"Evidence-based explanation.","confidence":0.0,
+"required_checks":["Concrete verification step."],"alternative_action":"GATHER_INFORMATION",
+"visual_summary":"What the image supports, or No image supplied.","uncertainties":["Important unknowns."]}}
+"""
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    data_url = context.get("image_data_url")
+    if data_url:
+        if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+            raise ValueError("image_data_url must be a valid image data URL.")
+    elif selected_image:
+        data_url = _build_image_data_url(selected_image)
+
+    image_attached = bool(data_url)
+    if image_attached:
+        content.append({"type": "input_image", "image_url": data_url})
+
+    payload = {"model": MODEL, "input": [{"type": "message", "role": "user", "content": content}]}
+    response = requests.post(
+        API_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=90,
+    )
+    response.raise_for_status()
+    response_data = response.json()
+    if response_data.get("status") not in {None, "completed"}:
+        raise RuntimeError(f"Muse Spark request did not complete: {response_data.get('status')}")
+
+    recommendation = _parse_recommendation(_extract_output_text(response_data))
+    summary = recommendation.get("visual_summary")
+    summary_present = isinstance(summary, str) and bool(summary.strip())
+
+    # These flags are adapter-generated, not model-controlled claims.
+    recommendation["_reroute_visual_input_attached"] = image_attached
+    recommendation["_reroute_visual_analysis_completed"] = image_attached and summary_present
+    return recommendation
+
+
+
+==================================================
+FILE: visual_evidence.py
+==================================================
+"""Structured assessment of visual evidence from Muse Spark."""
+
+
+def assess_visual_evidence(context, recommendation):
+    """Assess visual evidence without treating image descriptions as map facts."""
+    if not isinstance(context, dict):
+        raise TypeError("Context must be a dictionary.")
+    if not isinstance(recommendation, dict):
+        raise TypeError("Recommendation must be a dictionary.")
+
+    observations = context.get("visual_observations", [])
+    uncertainties = recommendation.get("uncertainties", [])
+    perception_status = context.get("perception_status", "UNKNOWN")
+
+    if not isinstance(observations, list):
+        observations = []
+    if not isinstance(uncertainties, list):
+        uncertainties = []
+
+    image_available = perception_status in {"IMAGE_READY_FOR_MUSE_SPARK", "IMAGE_ANALYZED"}
+    analysis_completed = perception_status == "IMAGE_ANALYZED"
+
+    return {
+        "image_available": image_available,
+        "analysis_completed": analysis_completed,
+        "observation_count": len(observations),
+        "observations": observations,
+        "uncertainties": uncertainties,
+        "evidence_status": (
+            "VISUAL_EVIDENCE_ANALYZED"
+            if analysis_completed
+            else "IMAGE_AVAILABLE_NOT_ANALYZED"
+            if image_available
+            else "NO_VERIFIED_VISUAL_INPUT"
+        ),
+        "navigation_coordinates_verified": False,
+    }
+
+
+
+==================================================
+FILE: simulation_controller.py
+==================================================
+"""Thread-gated bridge between existing REROUTE logic and a live UI."""
+from __future__ import annotations
+from collections import deque
+from threading import Condition, Thread
+import time
+from typing import Callable
+from agent import AgentEvent, AgentExecutionCancelled, AutonomousAgent
+from environment import Environment
+from milestone11_scenarios import validation_factories
+from visual_models import ActivityItem, DashboardSnapshot
+from decision_pipeline import run_decision_pipeline
+from meta_reasoning_adapter import get_recovery_recommendation
+from adaptive_learning import AdaptiveOutcomeMemory
+
+
+def mock_recommendation(context):
+    """Offline provider for integration tests; never calls Meta."""
+    if context.get("path_blocked") and context.get("safe_alternative_route"):
+        action = "REPLAN"
+    elif context.get("path_blocked"):
+        action = "GATHER_INFORMATION"
+    else:
+        action = "WAIT"
+    return {
+        "recommended_action": action,
+        "reason": "Offline test recommendation based on supplied environment state.",
+        "confidence": 0.80,
+        "required_checks": ["Verify the selected action against the current environment."],
+        "alternative_action": "GATHER_INFORMATION" if action != "GATHER_INFORMATION" else "REQUEST_HUMAN_HELP",
+        "visual_summary": "Offline provider; no image was sent to Muse Spark.",
+        "uncertainties": ["This is a mock recommendation, not a model response."],
+    }
+
+
+def reroute_decision_policy(context, live_reasoning: bool = False):
+    provider = get_recovery_recommendation if live_reasoning else mock_recommendation
+    mode = "LIVE MUSE SPARK" if live_reasoning else "OFFLINE MOCK"
+    print(f"REROUTE: decision pipeline triggered ({mode}).")
+    result = run_decision_pipeline(context, recommendation_provider=provider)
+    if result.get("status") != "EVALUATED":
+        raise RuntimeError(f"Decision pipeline did not produce an executable decision: {result}")
+    return result
+
+
+def scenario_factories() -> dict[str, Callable[[], Environment]]:
+    factories = {
+        "Default navigation": Environment,
+        "M4 obstacle appears": _appearing_obstacle,
+        "M4 temporary obstacle": _temporary_obstacle,
+        "M4 moving obstacle": _moving_obstacle,
+    }
+    factories.update({f"M11 {name}": factory for name, factory in validation_factories().items()})
+    return factories
+
+
+class SimulationController:
+    """Controls playback by pausing agent callbacks, never its decisions."""
+    def __init__(
+        self,
+        live_reasoning: bool = False,
+        vision_engine=None,
+        image_provider=None,
+    ) -> None:
+        self.live_reasoning = live_reasoning
+        self.vision_engine = vision_engine
+        self.image_provider = image_provider
+        # Shared across simulation runs for this controller instance.
+        self.adaptive_memory = AdaptiveOutcomeMemory(persistent=True)
+        self._live_request_used = False
+        self.factories = scenario_factories()
+        self.snapshot = DashboardSnapshot()
+        self.speed = 3.0
+        self.paused = True
+        self._step_budget = 0
+        self._cancelled = False
+        self._condition = Condition()
+        self._thread: Thread | None = None
+        self._environment: Environment | None = None
+        self._agent: AutonomousAgent | None = None
+        self.events: deque[AgentEvent] = deque(maxlen=200)
+
+    @property
+    def scenario_names(self) -> list[str]:
+        return list(self.factories)
+
+    def start(self, scenario: str | None = None, start_paused: bool = False) -> None:
+        if self._thread and self._thread.is_alive():
+            self.resume()
+            return
+
+        selected = scenario or self.snapshot.scenario
+        if selected not in self.factories:
+            raise ValueError(f"Unknown scenario: {selected}")
+
+        self._cancelled = False
+        # Allow one live model request per run; a new run gets a fresh allowance.
+        self._live_request_used = False
+        self.paused = start_paused
+        self._step_budget = 0
+        self.events.clear()
+        self._environment = self.factories[selected]()
+
+        def decision_policy(context):
+            # Consume the single live-call allowance before making the request.
+            # A failed/timeout request still counts as an attempt, preventing retries.
+            use_live = self.live_reasoning and not self._live_request_used
+            if use_live:
+                self._live_request_used = True
+            return reroute_decision_policy(context, live_reasoning=use_live)
+
+        self._agent = AutonomousAgent(
+            self._environment,
+            recovery_mode="m11",
+            logger=lambda _: None,
+            event_callback=self._on_agent_event,
+            decision_policy=decision_policy,
+            vision_engine=self.vision_engine,
+            image_provider=self.image_provider,
+            adaptive_memory=self.adaptive_memory,
+        )
+
+        self.snapshot = DashboardSnapshot(
+            scenario=selected,
+            status="PAUSED" if start_paused else "RUNNING",
+            state=self._environment.get_state(),
+            start_position=self._environment.agent_position,
+        )
+        self._thread = Thread(target=self._run_agent, daemon=True)
+        self._thread.start()
+
+    def pause(self) -> None:
+        with self._condition:
+            self.paused = True
+            self.snapshot.status = "PAUSED"
+
+    def resume(self) -> None:
+        with self._condition:
+            self.paused = False
+            self.snapshot.status = "RUNNING"
+            self._condition.notify_all()
+
+    def step(self) -> None:
+        with self._condition:
+            if self._thread is None or not self._thread.is_alive():
+                self.start(self.snapshot.scenario, start_paused=True)
+            self.paused = True
+            self._step_budget += 1
+            self.snapshot.status = "PAUSED"
+            self._condition.notify_all()
+
+    def reset(self, scenario: str | None = None) -> None:
+        with self._condition:
+            self._cancelled = True
+            self.paused = False
+            self._condition.notify_all()
+        if self._thread:
+            self._thread.join(timeout=1)
+        selected = scenario or self.snapshot.scenario
+        if selected not in self.factories:
+            raise ValueError(f"Unknown scenario: {selected}")
+        environment = self.factories[selected]()
+        self._environment = environment
+        self._thread = None
+        self.snapshot = DashboardSnapshot(scenario=selected, status="READY", state=environment.get_state(), start_position=environment.agent_position)
+        self.events.clear()
+
+    def set_speed(self, speed: float) -> None:
+        self.speed = max(0.25, min(20.0, speed))
+
+    def _run_agent(self) -> None:
+        try:
+            assert self._agent is not None
+            outcome = self._agent.run()
+            with self._condition:
+                self.snapshot.reached_goal = outcome.reached_goal
+                if not outcome.reached_goal:
+                    self.snapshot.safe_stop_reason = outcome.reason
+                self.snapshot.status = "GOAL REACHED" if outcome.reached_goal else "SAFE STOP"
+        except AgentExecutionCancelled:
+            pass
+        except Exception as error:
+            with self._condition:
+                self.snapshot.status = "ERROR"
+                self.snapshot.safe_stop_reason = str(error)
+
+    def _on_agent_event(self, event: AgentEvent) -> bool | None:
+        with self._condition:
+            if self._cancelled:
+                return False
+            while self.paused and self._step_budget == 0 and not self._cancelled:
+                self._condition.wait()
+            if self._cancelled:
+                return False
+            if self._step_budget:
+                self._step_budget -= 1
+            self.events.append(event)
+            self._apply_event(event)
+        if not self.paused:
+            time.sleep(1 / self.speed)
+        return True
+
+    def _apply_event(self, event: AgentEvent) -> None:
+        payload = event.payload
+
+                # Preserve complete recovery decision and prediction history.
+        if event.activity == "RECOVERING":
+            decision_details = payload.get("decision_details")
+
+            self.snapshot.decision_history.append({
+                "tick": event.tick,
+                "state_version": event.state_version,
+                "decision_source": payload.get(
+                    "decision_source", "UNKNOWN"
+                ),
+                "recovery_action": payload.get("recovery_action"),
+                "decision_reason": payload.get("decision_reason", ""),
+                "decision_error": payload.get("decision_error"),
+                "decision_details": (
+                    dict(decision_details)
+                    if isinstance(decision_details, dict)
+                    else None
+                ),
+            })
+        self.snapshot.state = dict(payload["state"])
+        if self._environment is not None:
+            self.snapshot.state["obstacle_info"] = {
+                tuple(position): self._environment.obstacle_info(position)
+                for position in self.snapshot.state["obstacles"]
+            }
+        self.snapshot.route = tuple(payload.get("route", ()))
+        self.snapshot.alternative_route = tuple(payload.get("alternative_route", ()))
+        self.snapshot.status = event.activity
+        self.snapshot.nodes_explored = int(payload.get("nodes_explored", self.snapshot.nodes_explored))
+        self.snapshot.recovery_attempts = int(payload.get("recoveries", self.snapshot.recovery_attempts))
+        self.snapshot.failed_movements = int(payload.get("failures", self.snapshot.failed_movements))
+        message = _event_message(event)
+        self.snapshot.activity.append(ActivityItem(event.activity, event.tick, message))
+        self.snapshot.activity = self.snapshot.activity[-8:]
+        if event.activity == "MOVING" and payload.get("expected_position"):
+            self.snapshot.visited.add(tuple(payload["state"]["agent_position"]))
+        failure = payload.get("failure")
+        diagnosis = payload.get("diagnosis")
+        if failure:
+            self.snapshot.reasoning["failure"] = failure.failure_type.value
+            self.snapshot.reasoning["evidence"] = failure.evidence
+        if diagnosis:
+            self.snapshot.reasoning["cause"] = diagnosis.cause.value
+            self.snapshot.reasoning["confidence"] = f"{diagnosis.confidence:.2f}"
+            self.snapshot.reasoning["support"] = diagnosis.supporting_evidence[0] if diagnosis.supporting_evidence else ""
+        if payload.get("recovery_action"):
+            self.snapshot.reasoning["action"] = payload["recovery_action"]
+            self.snapshot.reasoning["decision"] = payload.get("decision_reason", "")
+            self.snapshot.reasoning["decision_error"] = payload.get("decision_error")
+            if payload["recovery_action"] == "RETRY": self.snapshot.retries += 1
+            if payload["recovery_action"] == "REPLAN": self.snapshot.replans += 1
+        if payload.get("verification_state"):
+            self.snapshot.reasoning["verification"] = payload["verification_state"]
+        if event.activity == "GOAL_REACHED": self.snapshot.reached_goal = True
+        if event.activity == "SAFE_STOP": self.snapshot.safe_stop_reason = str(payload.get("reason", "safe stop"))
+
+
+def _event_message(event: AgentEvent) -> str:
+    payload = event.payload
+    if event.activity == "MOVING": return f"{payload.get('direction', '?')} -> {payload.get('expected_position', '')}"
+    if event.activity == "PLANNING": return f"{payload.get('algorithm', '')}: {payload.get('path_length', '?')} steps"
+    if event.activity == "SAFE_STOP": return str(payload.get("reason", "safe stop"))
+    if event.activity == "RECOVERING" and payload.get("decision_error"):
+        return f"LOCAL FALLBACK: {payload['decision_error']}"
+    return event.activity.replace("_", " ")
+
+
+def _appearing_obstacle() -> Environment:
+    environment = Environment(); environment.schedule_obstacle_event(1, "add", (0, 1)); return environment
+
+def _temporary_obstacle() -> Environment:
+    environment = Environment(); environment.schedule_obstacle_event(1, "add", (0, 1), duration=1); return environment
+
+def _moving_obstacle() -> Environment:
+    environment = Environment(); environment.add_dynamic_obstacle((1, 1)); environment.schedule_obstacle_event(1, "move", (1, 1), destination=(0, 1)); return environment
+
+
+
+==================================================
+FILE: adaptive_learning.py
+==================================================
+"""Persistent, verified adaptive outcome memory for REROUTE (M11).
+
+Only terminal, verified outcomes are stored. The JSON store is local to this
+machine, versioned, bounded, and written atomically. Set REROUTE_MEMORY_PATH
+to choose a different location; set REROUTE_DISABLE_PERSISTENCE=1 for
+ephemeral test/demo sessions.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+import json
+import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Iterable
+
+from outcome_verifier import VerificationState
+
+_SCHEMA_VERSION = 1
+_MAX_ATTEMPTS = 5000
+
+
+def _state_values(record) -> set[str]:
+    return {getattr(state, "value", str(state)) for state in getattr(record, "verification_states", ())}
+
+
+class AdaptiveOutcomeMemory:
+    """Accumulate verified outcomes and optionally retain them across restarts."""
+
+    def __init__(self, storage_path: str | os.PathLike | None = None, persistent: bool = False) -> None:
+        if os.environ.get("REROUTE_DISABLE_PERSISTENCE") == "1":
+            persistent = False
+        if storage_path is None and persistent:
+            storage_path = os.environ.get(
+                "REROUTE_MEMORY_PATH",
+                str(Path.home() / ".reroute" / "adaptive_memory.json"),
+            )
+        self.storage_path = Path(storage_path).expanduser() if storage_path else None
+        self._counts = defaultdict(lambda: {"success": 0, "failure": 0})
+        self._seen_attempts: set[str] = set()
+        self._total_ingested = 0
+        if self.storage_path:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            payload = json.loads(self.storage_path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != _SCHEMA_VERSION:
+                return
+            counts = payload.get("counts", {})
+            if not isinstance(counts, dict):
+                return
+            for cause, actions in counts.items():
+                if not isinstance(actions, dict):
+                    continue
+                for action, values in actions.items():
+                    if not isinstance(values, dict):
+                        continue
+                    success, failure = values.get("success", 0), values.get("failure", 0)
+                    if all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (success, failure)):
+                        self._counts[(str(cause), str(action))] = {"success": success, "failure": failure}
+            attempts = payload.get("seen_attempts", [])
+            if isinstance(attempts, list):
+                self._seen_attempts = {str(x) for x in attempts[-_MAX_ATTEMPTS:] if isinstance(x, str)}
+            total = payload.get("total_verified_outcomes", 0)
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                self._total_ingested = total
+        except (OSError, ValueError, TypeError, AttributeError):
+            # Corrupt/unavailable history must never prevent safe operation.
+            return
+
+    def _save(self) -> None:
+        if not self.storage_path:
+            return
+        grouped = {}
+        for (cause, action), values in self._counts.items():
+            grouped.setdefault(cause, {})[action] = dict(values)
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "total_verified_outcomes": self._total_ingested,
+            "seen_attempts": sorted(self._seen_attempts)[-_MAX_ATTEMPTS:],
+            "counts": grouped,
+        }
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile("w", encoding="utf-8", dir=self.storage_path.parent, delete=False) as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary = Path(handle.name)
+            os.replace(temporary, self.storage_path)
+        except OSError:
+            # Persistence is best-effort; the in-memory controller remains usable.
+            try:
+                temporary.unlink(missing_ok=True)
+            except (UnboundLocalError, OSError):
+                pass
+
+    def ingest(self, records: Iterable[object]) -> int:
+        added = 0
+        for record in records:
+            attempt_id = getattr(record, "attempt_id", "")
+            if not attempt_id or attempt_id in self._seen_attempts:
+                continue
+            action = getattr(getattr(record, "decision", None), "action", None)
+            action = getattr(action, "value", str(action))
+            if action == "REQUEST_HUMAN_HELP":
+                continue
+            states = _state_values(record)
+            cause = getattr(getattr(record, "diagnosis", None), "cause", "UNKNOWN")
+            cause = getattr(cause, "value", str(cause))
+            outcome = None
+            if VerificationState.RECOVERY_FAILED.value in states:
+                outcome = "failure"
+            elif action == "GATHER_INFORMATION" and VerificationState.OBSERVATION_REFRESHED.value in states:
+                outcome = "success"
+            elif action == "WAIT" and VerificationState.ENVIRONMENT_CHANGED.value in states:
+                outcome = "success"
+            elif VerificationState.PROGRESS_RESTORED.value in states or VerificationState.TASK_COMPLETED.value in states:
+                outcome = "success"
+            elif getattr(record, "succeeded", None) is False:
+                outcome = "failure"
+            if outcome is None:
+                continue
+            self._counts[("ALL", action)][outcome] += 1
+            self._counts[(cause, action)][outcome] += 1
+            self._seen_attempts.add(str(attempt_id))
+            self._total_ingested += 1
+            added += 1
+        if added:
+            if len(self._seen_attempts) > _MAX_ATTEMPTS:
+                self._seen_attempts = set(sorted(self._seen_attempts)[-_MAX_ATTEMPTS:])
+            self._save()
+        return added
+
+    def snapshot(self, diagnosis: str | None = None) -> dict:
+        key_prefix = diagnosis if diagnosis else "ALL"
+        counts = {action: dict(values) for (cause, action), values in self._counts.items() if cause == key_prefix}
+        return {
+            "source": "PERSISTENT_VERIFIED_RUNTIME_OUTCOMES" if self.storage_path else "VERIFIED_RUNTIME_OUTCOMES",
+            "diagnosis": diagnosis or "ALL",
+            "action_statistics": counts,
+            "observations": sum(v["success"] + v["failure"] for v in counts.values()),
+            "total_verified_outcomes": self._total_ingested,
+            "persistence_enabled": self.storage_path is not None,
+        }
+
+    @property
+    def total_verified_outcomes(self) -> int:
+        return self._total_ingested
+
+
+
+==================================================
+FILE: evaluation.py
+==================================================
+"""Repeatable baseline-versus-REROUTE outcome evaluation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from statistics import mean
+from typing import Callable
+
+from agent import AutonomousAgent
+from environment import Environment
+from pathfinder import astar_search
+from recovery import RecoveryAction
+
+
+@dataclass(frozen=True)
+class TrialResult:
+    strategy: str
+    scenario: str
+    trial: int
+    reached_goal: bool
+    restored_progress: bool
+    ticks: int
+    path_length: int
+    failed_actions: int
+    recovery_attempts: int
+    recovery_successes: int
+    recovery_ticks: int
+    replans: int
+    human_requests: int
+    recovery_outcomes: tuple[tuple[str, bool], ...] = ()
+
+
+@dataclass(frozen=True)
+class AggregateMetrics:
+    strategy: str
+    trials: int
+    completion_rate: float
+    recovery_success_rate: float
+    average_completion_ticks: float
+    average_path_length: float
+    failed_actions: int
+    replans: int
+    human_requests: int
+    unsuccessful_tasks: int
+    average_recovery_ticks: float
+
+
+ScenarioFactory = Callable[[], Environment]
+
+
+class EvaluationRunner:
+    """Runs equivalent deterministic environments for both navigation strategies."""
+
+    def __init__(self, trials_per_scenario: int = 3) -> None:
+        self.trials_per_scenario = trials_per_scenario
+        self.scenarios: dict[str, ScenarioFactory] = {
+            "temporary_obstacle": self._temporary_obstacle,
+            "persistent_obstacle": self._persistent_obstacle,
+            "moving_obstacle": self._moving_obstacle,
+            "repeated_movement_failures": self._repeated_failures,
+            "uncertain_information": self._uncertain_information,
+            "unreachable_goal": self._unreachable_goal,
+        }
+
+    def run(self) -> list[TrialResult]:
+        results: list[TrialResult] = []
+
+        for name, factory in self.scenarios.items():
+            for trial in range(1, self.trials_per_scenario + 1):
+                results.append(
+                    self._run_immediate(name, trial, factory())
+                )
+                results.append(
+                    self._run_adaptive(name, trial, factory())
+                )
+
+        return results
+
+    def configurations_are_equivalent(self) -> bool:
+        """Verify factory-created starting states match before assigning strategies."""
+
+        for factory in self.scenarios.values():
+            first, second = factory(), factory()
+
+            if (
+                first.get_state() != second.get_state()
+                or first.events != second.events
+            ):
+                return False
+
+        return True
+
+    def aggregate(self, results: list[TrialResult]) -> list[AggregateMetrics]:
+        output: list[AggregateMetrics] = []
+
+        for strategy in (
+            "Immediate replanning",
+            "REROUTE adaptive recovery"
+        ):
+            group = [
+                item for item in results
+                if item.strategy == strategy
+            ]
+
+            completed = [
+                item for item in group
+                if item.reached_goal
+            ]
+
+            recovery_attempts = sum(
+                item.recovery_attempts for item in group
+            )
+
+            output.append(
+                AggregateMetrics(
+                    strategy,
+                    len(group),
+                    len(completed) / len(group) if group else 0.0,
+                    (
+                        sum(item.recovery_successes for item in group)
+                        / recovery_attempts
+                        if recovery_attempts else 0.0
+                    ),
+                    mean(item.ticks for item in completed)
+                    if completed else 0.0,
+                    mean(item.path_length for item in completed)
+                    if completed else 0.0,
+                    sum(item.failed_actions for item in group),
+                    sum(item.replans for item in group),
+                    sum(item.human_requests for item in group),
+                    len(group) - len(completed),
+                    (
+                        sum(item.recovery_ticks for item in group)
+                        / recovery_attempts
+                        if recovery_attempts else 0.0
+                    ),
+                )
+            )
+
+        return output
+
+    def report(self, results: list[TrialResult]) -> str:
+        metrics = self.aggregate(results)
+
+        lines = [
+            "| Strategy | Completion | Recovery success | Avg completion ticks | Avg recovery ticks | Avg path length | Failed actions | Replans | Human requests | Unsuccessful |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        ]
+
+        for item in metrics:
+            lines.append(
+                f"| {item.strategy} | "
+                f"{item.completion_rate:.0%} | "
+                f"{item.recovery_success_rate:.0%} | "
+                f"{item.average_completion_ticks:.1f} | "
+                f"{item.average_recovery_ticks:.1f} | "
+                f"{item.average_path_length:.1f} | "
+                f"{item.failed_actions} | "
+                f"{item.replans} | "
+                f"{item.human_requests} | "
+                f"{item.unsuccessful_tasks} |"
+            )
+
+        baseline, adaptive = metrics
+
+        difference = (
+            adaptive.completion_rate - baseline.completion_rate
+        ) * 100
+
+        lines.append(
+            f"\nCompletion-rate difference "
+            f"(adaptive - immediate): {difference:+.1f} percentage points."
+        )
+
+        return "\n".join(lines)
+
+    def _run_adaptive(
+        self,
+        scenario: str,
+        trial: int,
+        environment: Environment
+    ) -> TrialResult:
+
+        outcome = AutonomousAgent(
+            environment,
+            logger=lambda _: None
+        ).run()
+
+        recoveries = outcome.recoveries
+
+        # Preserve individual action outcomes for future prediction.
+        recovery_outcomes = tuple(
+            (
+                record.decision.action.value,
+                record.succeeded
+            )
+            for record in recoveries
+        )
+
+        return TrialResult(
+            "REROUTE adaptive recovery",
+            scenario,
+            trial,
+            outcome.reached_goal,
+            outcome.reached_goal and any(
+                record.succeeded for record in recoveries
+            ),
+            environment.tick,
+            outcome.successful_moves,
+            outcome.failed_moves,
+            len(recoveries),
+            sum(record.succeeded for record in recoveries),
+            sum(record.ticks_spent for record in recoveries),
+            sum(
+                record.decision.action == RecoveryAction.REPLAN
+                for record in recoveries
+            ),
+            sum(
+                record.decision.action == RecoveryAction.REQUEST_HUMAN_HELP
+                for record in recoveries
+            ),
+            recovery_outcomes
+        )
+
+    def _run_immediate(
+        self,
+        scenario: str,
+        trial: int,
+        environment: Environment
+    ) -> TrialResult:
+
+        successful_moves = 0
+        failed_actions = 0
+        replans = 0
+        recovery_attempts = 0
+        recovery_successes = 0
+
+        limit = environment.width * environment.height * 3
+
+        while successful_moves + failed_actions < limit:
+
+            state = environment.get_state()
+
+            route = astar_search(
+                state["agent_position"],
+                state["goal_position"],
+                state["obstacles"],
+                state["width"],
+                state["height"]
+            ).path
+
+            if not route:
+                break
+
+            restarted = False
+
+            for next_position in route[1:]:
+
+                environment.advance()
+
+                if tuple(next_position) in set(
+                    environment.get_state()["obstacles"]
+                ):
+                    replans += 1
+                    recovery_attempts += 1
+
+                    alternative = astar_search(
+                        environment.agent_position,
+                        environment.goal_position,
+                        environment.obstacles,
+                        environment.width,
+                        environment.height
+                    ).path
+
+                    recovery_successes += bool(alternative)
+                    restarted = True
+                    break
+
+                direction = _direction(
+                    environment.agent_position,
+                    tuple(next_position)
+                )
+
+                result = environment.move(direction)
+
+                if not result.moved:
+
+                    failed_actions += 1
+                    replans += 1
+                    recovery_attempts += 1
+
+                    alternative = astar_search(
+                        environment.agent_position,
+                        environment.goal_position,
+                        environment.obstacles,
+                        environment.width,
+                        environment.height
+                    ).path
+
+                    recovery_successes += bool(alternative)
+                    restarted = True
+                    break
+
+                successful_moves += 1
+
+                if environment.agent_position == environment.goal_position:
+
+                    return TrialResult(
+                        "Immediate replanning",
+                        scenario,
+                        trial,
+                        True,
+                        recovery_successes > 0,
+                        environment.tick,
+                        successful_moves,
+                        failed_actions,
+                        recovery_attempts,
+                        recovery_successes,
+                        0,
+                        replans,
+                        0
+                    )
+
+            if not restarted:
+                break
+
+        return TrialResult(
+            "Immediate replanning",
+            scenario,
+            trial,
+            False,
+            False,
+            environment.tick,
+            successful_moves,
+            failed_actions,
+            recovery_attempts,
+            recovery_successes,
+            0,
+            replans,
+            0
+        )
+
+    @staticmethod
+    def _temporary_obstacle() -> Environment:
+        environment = Environment()
+        environment.schedule_obstacle_event(
+            1, "add", (0, 1), duration=1
+        )
+        return environment
+
+    @staticmethod
+    def _persistent_obstacle() -> Environment:
+        environment = Environment()
+        environment.schedule_obstacle_event(
+            1, "add", (0, 1)
+        )
+        return environment
+
+    @staticmethod
+    def _moving_obstacle() -> Environment:
+        environment = Environment()
+        environment.add_dynamic_obstacle((1, 1))
+        environment.schedule_obstacle_event(
+            1, "move", (1, 1), destination=(0, 1)
+        )
+        return environment
+
+    @staticmethod
+    def _repeated_failures() -> Environment:
+        environment = Environment()
+        environment.set_transient_move_failures(2)
+        return environment
+
+    @staticmethod
+    def _uncertain_information() -> Environment:
+        environment = Environment()
+        environment.set_transient_move_failures(1)
+        return environment
+
+    @staticmethod
+    def _unreachable_goal() -> Environment:
+        return Environment(
+            width=3,
+            height=3,
+            agent_position=(0, 0),
+            goal_position=(2, 2),
+            obstacles=[(1, 0), (0, 1)]
+        )
+
+
+def _direction(
+    current: tuple[int, int],
+    target: tuple[int, int]
+) -> str:
+
+    return {
+        (0, -1): "up",
+        (0, 1): "down",
+        (-1, 0): "left",
+        (1, 0): "right"
+    }[
+        (
+            target[0] - current[0],
+            target[1] - current[1]
+        )
+    ]

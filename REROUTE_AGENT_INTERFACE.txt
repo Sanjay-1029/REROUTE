@@ -1,0 +1,521 @@
+
+=================================================================
+AutonomousAgent.__init__
+=================================================================
+    def __init__(
+        self,
+        environment: Environment,
+        algorithm: str = "astar",
+        logger: Callable[[str], None] = print,
+        max_recovery_attempts: int = 3,
+        recovery_enabled: bool = True,
+        recovery_mode: str = "m9",
+        max_wait_ticks: int = 5,
+        event_callback: Callable[[AgentEvent], bool | None] | None = None,
+        decision_policy: Callable[[dict], dict] | None = None,
+        vision_engine: Any | None = None,
+        image_provider: Callable[[], Any] | None = None,
+        adaptive_memory: AdaptiveOutcomeMemory | None = None,
+    ) -> None:
+        if algorithm not in {"bfs", "astar"}:
+            raise ValueError("algorithm must be 'bfs' or 'astar'.")
+        if recovery_mode not in {"m9", "m11"}:
+            raise ValueError("recovery_mode must be 'm9' or 'm11'.")
+        self.environment = environment
+        self.algorithm = algorithm
+        self.logger = logger
+        self.route: list[list[int]] | None = None
+        self.actions: list[ActionRecord] = []
+        self.invalidated_positions: list[Position] = []
+        self.failure_detector = FailureDetector()
+        self.diagnosis_engine = FailureDiagnosis()
+        self.recovery_engine = RecoveryEngine(max_recovery_attempts)
+        self.recovery_enabled = recovery_enabled
+        self.recovery_mode = recovery_mode
+        self.max_wait_ticks = max_wait_ticks
+        self._pending_recoveries: list[str] = []
+        self._movement_limit = 0
+        self.event_callback = event_callback
+        self.decision_policy = decision_policy
+        self.vision_engine = vision_engine
+        self.image_provider = image_provider
+        self.adaptive_memory = adaptive_memory or AdaptiveOutcomeMemory()
+        self.alternative_route: list[list[int]] | None = None
+        self.last_visual_context: dict[str, Any] = {}
+        self.visual_observation_history: list[dict[str, Any]] = []
+
+=================================================================
+AutonomousAgent.plan_route
+=================================================================
+    def plan_route(self) -> SearchResult:
+        """Read a fresh environment snapshot and plan from the actual position."""
+        self._emit("OBSERVING")
+        state = self.environment.get_state()
+        search = astar_search if self.algorithm == "astar" else bfs_search
+        result = search(
+            state["agent_position"], state["goal_position"], state["obstacles"],
+            state["width"], state["height"],
+        )
+        self.route = result.path
+        self._emit("PLANNING", algorithm=result.algorithm, nodes_explored=result.explored_nodes, path_length=result.steps)
+        if result.path:
+            self._log(f"PLAN {result.algorithm}: {result.steps} steps, {result.explored_nodes} nodes explored.")
+        else:
+            self._log(f"PLAN {result.algorithm}: no route available.")
+        return result
+
+=================================================================
+AutonomousAgent.run
+=================================================================
+    def run(self, max_steps: int | None = None) -> AgentRunResult:
+        """Execute verified routes and bounded, diagnosis-driven recovery actions."""
+        self.actions = []
+        self.invalidated_positions = []
+        self.failure_detector = FailureDetector()
+        self.diagnosis_engine = FailureDiagnosis()
+        self.recovery_engine = RecoveryEngine(self.recovery_engine.max_attempts)
+        self._pending_recoveries = []
+        self.last_visual_context = {}
+        self.visual_observation_history = []
+        state = self.environment.get_state()
+        if state["agent_position"] == state["goal_position"]:
+            self.failure_detector.observe_goal_reached(self.environment)
+            self._log("GOAL already reached.")
+            self._emit("GOAL_REACHED")
+            return self._result(True, "goal_reached")
+
+        limit = max_steps if max_steps is not None else state["width"] * state["height"]
+        self._movement_limit = limit
+        while len(self.actions) < limit:
+            search_result = self.plan_route()
+            if not search_result.path:
+                failure = self.failure_detector.observe_no_route(self.environment)
+                if not self.recovery_enabled:
+                    return self._result(False, "no_route")
+                if not self._recover(failure, None):
+                    return self._result(False, "no_route")
+                continue
+            recovery_needed = False
+            for index in range(1, len(search_result.path)):
+                if len(self.actions) >= limit:
+                    return self._result(False, "step_limit_reached")
+                self.environment.advance()
+                blocked = self._blocked_route_positions(search_result.path[index:])
+                if blocked:
+                    self.invalidated_positions = blocked
+                    failure = self.failure_detector.observe_route_outdated(self.environment, blocked)
+                    self._emit("FAILURE_DETECTED", failure=failure, affected_nodes=blocked)
+                    self._log(f"ROUTE OUTDATED: obstacle(s) now occupy {blocked}.")
+                    if not self.recovery_enabled:
+                        return self._result(False, "route_outdated")
+                    if not self._recover(failure, tuple(search_result.path[index])):
+                        return self._result(False, "route_outdated")
+                    recovery_needed = True
+                    break
+                record = self.execute_next(search_result.path[index])
+                if not record.succeeded:
+                    failure = self.failure_detector.history[-1]
+                    self._emit("FAILURE_DETECTED", failure=failure)
+                    if not self.recovery_enabled:
+                        return self._result(False, record.reason)
+                    if not self._recover(failure, tuple(search_result.path[index])):
+                        return self._result(False, record.reason)
+                    recovery_needed = True
+                    break
+                if self.environment.agent_position == self.environment.goal_position:
+                    self.failure_detector.observe_goal_reached(self.environment)
+                    self._verify_task_completed()
+                    self._log("GOAL reached and position verified.")
+                    self._emit("GOAL_REACHED")
+                    return self._result(True, "goal_reached")
+            if not recovery_needed:
+                return self._result(False, "route_finished_without_goal")
+        return self._result(False, "step_limit_reached")
+
+=================================================================
+AutonomousAgent.execute_next
+=================================================================
+    def execute_next(self, expected_position: Position | list[int]) -> ActionRecord:
+        """Select, execute, and verify the one action that should reach a route node."""
+        expected = tuple(expected_position)
+        current = self.environment.agent_position
+        delta = (expected[0] - current[0], expected[1] - current[1])
+        direction = self._DIRECTION_FOR_DELTA.get(delta)
+        step = len(self.actions) + 1
+        if direction is None:
+            record = ActionRecord(step, None, expected, current, False, "invalid_route_step")
+            self.actions.append(record)
+            self._log(f"STEP {step}: invalid route transition {current} -> {expected}.")
+            return record
+
+        self._log(f"STEP {step}: at {current}; choosing {direction} toward {expected}.")
+        self._emit("MOVING", direction=direction, expected_position=expected)
+        movement: MoveResult = self.environment.move(direction)
+        actual = self.environment.agent_position
+        if not movement.moved:
+            reason = f"movement_blocked:{movement.reason}"
+            succeeded = False
+        elif actual != expected:
+            reason = "unexpected_position"
+            succeeded = False
+        else:
+            reason = "moved"
+            succeeded = True
+        record = ActionRecord(step, direction, expected, actual, succeeded, reason)
+        self.actions.append(record)
+        detected = self.failure_detector.observe_movement(self.environment, movement, expected)
+        if detected:
+            self._log(f"CLASSIFIED {detected.failure_type.value}: {detected.evidence}")
+        self._log(f"STEP {step}: {'verified' if succeeded else 'failure'}; actual position {actual} ({reason}).")
+        if succeeded and self.recovery_mode == "m11" and self._pending_recoveries:
+            self._verify_progress_restored(actual)
+        return record
+
+=================================================================
+AutonomousAgent._recover_m11
+=================================================================
+    def _recover_m11(self, failure: FailureRecord, expected: Position | None) -> bool:
+        """Candidate recovery with visual context and bounded verification."""
+
+        diagnosis = self.diagnosis_engine.diagnose(
+            failure,
+            self.environment,
+            self.actions,
+            self.failure_detector.history
+        )
+
+        self._emit("DIAGNOSING", failure=failure, diagnosis=diagnosis)
+
+        alternative = self._safe_alternative_exists()
+
+        # Collect visual observations independently of the external policy.
+        visual_context = self._collect_visual_context(
+            failure=failure,
+            diagnosis=diagnosis,
+            alternative=alternative
+        )
+
+        self.last_visual_context = visual_context
+        self._record_visual_observation(visual_context, "PRE_DECISION")
+
+        self._log(
+            f"VISUAL PERCEPTION: "
+            f"{visual_context.get('perception_status', 'UNKNOWN')} | "
+            f"detections={visual_context.get('visual_detection_count', 0)}"
+        )
+        decision_data = None
+        decision_source = "LOCAL_RECOVERY"
+        decision_error = None
+
+        # Only verified prior outcomes enter adaptive memory. Ingest before
+        # each new decision so completed recoveries can inform later choices.
+        self.adaptive_memory.ingest(self.recovery_engine.history)
+        adaptive_snapshot = self.adaptive_memory.snapshot(diagnosis.cause.value)
+
+        # Use external decision policy if configured.
+        if self.decision_policy is not None:
+            try:
+                decision_data = self.decision_policy({
+                    "failure_type": failure.failure_type.value,
+                    "diagnosis": diagnosis.cause.value,
+                    "confidence": diagnosis.confidence,
+                    "environment_state": self.environment.get_state(),
+                    "safe_alternative_route": alternative,
+                    "obstacles_known": True,
+                    "path_blocked": failure.failure_type.value == "MOVEMENT_BLOCKED",
+                    "recovery_history": [
+                        record.decision.action.value
+                        for record in self.recovery_engine.history
+                    ],
+                    "visual_context": visual_context,
+                    "visual_observations": visual_context.get(
+                        "visual_observations", []
+                    ),
+                    "visual_detection_count": visual_context.get(
+                        "visual_detection_count", 0
+                    ),
+                    "perception_status": visual_context.get(
+                        "perception_status", "UNKNOWN"
+                    ),
+                    "image_path": visual_context.get("image_path"),
+                    "image_data_url": visual_context.get("image_data_url"),
+                    "perception_source": visual_context.get("perception_source"),
+                    "visual_note": visual_context.get("visual_note"),
+                    "visual_navigation_warning": visual_context.get("visual_navigation_warning", False),
+                    "perception_limitation": visual_context.get("perception_limitation"),
+                    "adaptive_learning": adaptive_snapshot,
+                })
+
+                if not isinstance(decision_data, dict):
+                    raise TypeError("Decision policy must return a dictionary.")
+
+                if "selected_action" not in decision_data:
+                    raise KeyError(
+                        "Decision policy result is missing 'selected_action'."
+                    )
+
+                action = RecoveryAction(decision_data["selected_action"])
+
+                decision = RecoveryDecision(
+                    action=action,
+                    reason="Decision pipeline recommendation"
+                )
+                decision_source = "EXTERNAL_DECISION_PIPELINE"
+
+            except Exception as error:
+                decision_error = str(error)
+                self._log(
+                    f"External decision failed: {decision_error}. Using local recovery."
+                )
+
+                # Do not display an incomplete or invalid result as a model decision.
+                decision_data = None
+                decision_source = "LOCAL_RECOVERY"
+
+                decision = self.recovery_engine.decide(
+                    diagnosis,
+                    self.environment,
+                    alternative
+                )
+
+        else:
+            decision = self.recovery_engine.decide(
+                diagnosis,
+                self.environment,
+                alternative
+            )
+
+        start_tick = self.environment.tick
+        start_version = self.environment.state_version
+        nodes = (expected,) if expected else ()
+
+        self._log(
+            f"RECOVERY {decision.action.value}: {decision.reason}"
+        )
+
+        # Forward the complete pipeline result with the actual selected action.
+        # The observer receives this data but does not control agent execution.
+        self._emit(
+            "RECOVERING",
+            diagnosis=diagnosis,
+            recovery_action=decision.action.value,
+            decision_reason=decision.reason,
+            decision_source=decision_source,
+            decision_details=decision_data,
+            decision_error=decision_error
+        )
+
+        if decision.action == RecoveryAction.REQUEST_HUMAN_HELP:
+            self.recovery_engine.record(
+                diagnosis, decision, "human_help_requested", False,
+                start_tick=start_tick,
+                end_tick=self.environment.tick,
+                affected_route_nodes=nodes,
+                observation_versions=(
+                    start_version,
+                     self.environment.state_version
+                )
+            )
+            return False
+
+        if decision.action == RecoveryAction.WAIT:
+            info = (
+                self.environment.obstacle_info(expected)
+                if expected else {}
+            )
+
+            duration = info.get("remaining_duration")
+
+            budget = min(
+                self.max_wait_ticks,
+                duration if isinstance(duration, int)
+                else self.max_wait_ticks
+            )
+
+            budget = max(1, budget)
+            versions = [start_version]
+
+            for waited in range(1, budget + 1):
+                self.environment.advance()
+                versions.append(self.environment.state_version)
+
+                info = (
+                    self.environment.obstacle_info(expected)
+                    if expected else {"present": True}
+                )
+
+                if not info.get("present", False):
+                    record = self.recovery_engine.record(
+                        diagnosis, decision, "obstacle_cleared", True,
+                        waited, start_tick, self.environment.tick,
+                        nodes, tuple(versions)
+                    )
+
+                    self.recovery_engine.verify(
+                        record.attempt_id,
+                        VerificationState.ENVIRONMENT_CHANGED,
+                        "Expected route node became clear during bounded wait."
+                    )
+
+                    self._pending_recoveries.append(record.attempt_id)
+                    return True
+
+                if self._safe_alternative_exists():
+                    record = self.recovery_engine.record(
+                        diagnosis, decision, "alternative_route_observed",
+                        True, waited, start_tick, self.environment.tick,
+                        nodes, tuple(versions)
+                    )
+
+                    self._pending_recoveries.append(record.attempt_id)
+                    return True
+
+            self.recovery_engine.record(
+                diagnosis, decision, "wait_budget_exhausted", False,
+                budget, start_tick, self.environment.tick,
+                nodes, tuple(versions)
+            )
+            return False
+
+        if decision.action == RecoveryAction.RETRY and expected is not None:
+            versions = [start_version]
+            result = None
+
+            for retry_count in range(1, 3):
+                if len(self.actions) >= self._movement_limit:
+                    break
+
+                self.environment.advance()
+                versions.append(self.environment.state_version)
+
+                if expected in self._blocked_route_positions([list(expected)]):
+                    break
+
+                result = self.execute_next(expected)
+
+                if result.succeeded:
+                    record = self.recovery_engine.record(
+                        diagnosis, decision,
+                        f"retry_succeeded; verified_retries={retry_count}",
+                        True, retry_count, start_tick,
+                        self.environment.tick, nodes, tuple(versions)
+                    )
+
+                    self._pending_recoveries.append(record.attempt_id)
+                    return True
+
+                if "transient_failure" not in result.reason:
+                    break
+
+            self.recovery_engine.record(
+                diagnosis, decision,
+                "retry_budget_exhausted_or_route_changed",
+               False, 0, start_tick, self.environment.tick,
+               nodes, tuple(versions)
+            )
+            return False
+
+        if decision.action == RecoveryAction.GATHER_INFORMATION:
+            # The action is not complete until a post-action observation has
+            # been requested. The provider is called again so camera-backed
+            # implementations can return a genuinely new frame.
+            snapshot = self.environment.get_state()
+            refreshed_context = self._collect_visual_context(
+                failure=failure,
+                diagnosis=diagnosis,
+                alternative=self._safe_alternative_exists(),
+            )
+            self.last_visual_context = refreshed_context
+            observation = self._record_visual_observation(
+                refreshed_context,
+                "POST_ACTION_REOBSERVATION",
+            )
+            refreshed = observation["image_available"]
+            result_text = (
+                f"snapshot_v{snapshot['state_version']}; "
+                f"post_action_observation={observation['perception_status']}"
+            )
+
+            record = self.recovery_engine.record(
+                diagnosis, decision,
+                result_text,
+                True, 0, start_tick, self.environment.tick,
+                nodes,
+                (start_version, snapshot["state_version"])
+            )
+            if refreshed:
+                self.recovery_engine.verify(
+                    record.attempt_id,
+                    VerificationState.OBSERVATION_REFRESHED,
+                    (
+                        "A post-action image was acquired and passed through "
+                        "the configured local visual-perception path."
+                    ),
+                )
+
+            self._pending_recoveries.append(record.attempt_id)
+            return True
+
+        if decision.action == RecoveryAction.REPLAN:
+            record = self.recovery_engine.record(
+                diagnosis, decision,
+                "alternative_route_available"
+                if alternative else "no_alternative_route",
+                alternative, 0, start_tick, self.environment.tick,
+                nodes,
+                (start_version, self.environment.state_version)
+            )
+
+            if alternative:
+                self._pending_recoveries.append(record.attempt_id)
+
+            return alternative
+
+        self.recovery_engine.record(
+            diagnosis, decision, "recovery_not_executable", False,
+            start_tick=start_tick,
+            end_tick=self.environment.tick,
+            affected_route_nodes=nodes,
+            observation_versions=(
+                start_version,
+                self.environment.state_version
+            )
+        )
+
+        return False
+
+=================================================================
+Environment.move
+=================================================================
+    def move(self, direction: str) -> MoveResult:
+        """Attempt one movement and return a verified outcome without printing."""
+        previous_position = self.agent_position
+        if self._transient_move_failures:
+            self._transient_move_failures -= 1
+            self.events.append(f"move_failed:transient_failure:{previous_position}")
+            return MoveResult(False, "transient_failure", previous_position, previous_position)
+        if direction not in self.DIRECTIONS:
+            return self._record_move(False, "invalid_direction", previous_position)
+        dx, dy = self.DIRECTIONS[direction]
+        target = (previous_position[0] + dx, previous_position[1] + dy)
+        if not self.in_bounds(target):
+            return self._record_move(False, "outside_grid", previous_position)
+        if target in self._all_obstacles():
+            return self._record_move(False, "obstacle", previous_position)
+
+        self.agent_position = target
+        self.state_version += 1
+        self.events.append(f"move:{direction}:{previous_position}->{target}")
+        return MoveResult(True, "moved", previous_position, target)
+
+=================================================================
+Environment.get_state
+=================================================================
+    def get_state(self) -> dict[str, object]:
+        """Return a copy-safe state snapshot for controllers and diagnostics."""
+        return {
+            "width": self.width, "height": self.height,
+            "agent_position": self.agent_position, "goal_position": self.goal_position,
+            "obstacles": tuple(sorted(self._all_obstacles())), "tick": self.tick,
+            "state_version": self.state_version,
+        }
